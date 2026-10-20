@@ -237,6 +237,17 @@
       border: 1px solid #7dd3fc;
       flex-shrink: 0; white-space: nowrap; cursor: default;
     }
+    /* Excel note — its own line under the file name */
+    .note-badge {
+      display: inline-block; margin-top: 3px;
+      padding: 1px 8px; border-radius: 50px;
+      font-size: 0.72rem; font-weight: 600;
+      background: #f1f3fa; color: var(--muted);
+      border: 1px solid var(--border);
+      max-width: 100%;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: help;
+    }
+    .note-badge.timed { background: #fff4e6; color: #d9480f; border-color: #ffc078; font-weight: 700; }
     .file-icon[data-action="preview"]:hover { filter: brightness(0.8); }
 
     .file-actions { display: flex; gap: 4px; flex-shrink: 0; }
@@ -596,17 +607,38 @@
   //  Business rules — everything that may need changing lives here
   // ══════════════════════════════════════════════════════════════
   const CONFIG = {
-    // Local delivery: sorted by the delivery date itself
-    LOCAL_CITIES: [
-      'ירושלים','בני ברק','בית שמש','ביתר','ביתר עילית',
-      'מודיעין עילית','ערד','קרית גת','אלעד'
+    // ── Deliveries ("משלוח") by city ──
+    //  group 'first' → before far cities, group 'last' → after them; within a group by `order`.
+    //  leadDays: working days before delivery the order must go out (Fri/Sat skipped).
+    //  Matching ignores quotes and case, and accepts a suffix ("ירושלים - קרית משה").
+    CITIES: [
+      { aliases: ['ירושלים'],                                               group: 'first', order: 1, leadDays: 0 },
+      { aliases: ['ביתר', 'ביתר עילית'],                                     group: 'first', order: 2, leadDays: 0 },
+      { aliases: ['מודיעין עילית', 'מודיעין עלית', 'קרית ספר', 'קריית ספר', 'ק"ס'], group: 'first', order: 3, leadDays: 1 },
+      { aliases: ['ערד'],                                                   group: 'last',  order: 1, leadDays: 0 },
+      { aliases: ['קרית גת', 'קריית גת'],                                    group: 'last',  order: 2, leadDays: 0 },
+      { aliases: ['אלעד'],                                                  group: 'last',  order: 3, leadDays: 0 },
+      { aliases: ['בני ברק', 'ב"ב'],                                         group: 'last',  order: 4, leadDays: 0 },
+      // Abroad — handled like בני ברק (any city written in Latin letters counts as abroad too)
+      { aliases: ['לונדון', 'אנטוורפן', "מנצ'סטר"],                            group: 'last',  order: 4, leadDays: 0, abroad: true },
+      { aliases: ['אשדוד'],                                                 group: 'last',  order: 5, leadDays: 0 },
+      { aliases: ['בית שמש', 'רמת בית שמש'],                                  group: 'last',  order: 6, leadDays: 0 },
     ],
-    // Shipments here must be ready one working day before delivery (Fri/Sat → Thu).
-    // Checked before LOCAL_CITIES. Quotes are ignored, so ק"ס = ק״ס = קס.
-    DAY_BEFORE_CITIES: ['מודיעין עילית', 'קרית ספר', 'קריית ספר', 'ק"ס'],
-    DAY_BEFORE_DAYS: 1,
-    // Any other city: shipping takes this many working days (not counting pickup day, Fri, Sat)
+    // Any other city is far: shipping takes this many working days (not counting pickup day, Fri, Sat)
     FAR_CITY_SHIPPING_DAYS: 3,
+
+    // ── Pickups from a store ("איסוף מ…"), in this order, after self pickup ──
+    PICKUP_ORDER: ['איסוף מאשדוד', 'איסוף מבני ברק', 'איסוף ממאה שערים', 'איסוף משמגר', 'איסוף מבית שמש'],
+
+    // ── A deadline in "פרטים" / "הוראות לשליח" ("עד 12", "עד השעה 14:30", "בוקר") ──
+    //  moves the order inside its day; earlier hour first. upTo is minutes (12:00 = 720).
+    //  Later than the last slot → no change.
+    TIME_SLOTS: [
+      { upTo: 12 * 60, slot: 'before-first' },   // עד 12 (and "בוקר"/"מוקדם"/"צהריים") → before ירושלים
+      { upTo: 13 * 60, slot: 'before-far' },     // עד 1  → before far cities
+      { upTo: 15 * 60, slot: 'after-far' },      // עד 3  → after far cities
+      { upTo: 18 * 60 - 1, slot: 'after-deliveries' }, // עד 5 → after all deliveries
+    ],
 
     // Excel rows left out of the date sort (they go to the end of the list)
     SKIP_RULES: [
@@ -648,7 +680,8 @@
   let idCounter = 0;
   let sortableInst;
   let mergedObjectUrl = null;
-  let deliveryMap = {};       // SO_NUMBER → 'YYYY-MM-DD' sortable key
+  let deliveryMap = {};       // SO_NUMBER → { date: 'YYYY-MM-DD' (day it goes out), rank, sub }
+  let notesMap = {};          // SO_NUMBER → { details, courier, deadline } from the Excel
   let excelLoaded = false;
 
   // ── Elements ──
@@ -770,24 +803,110 @@
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
   }
 
-  // ── Local-delivery cities (no shipping lead time) ──
-  function isLocalCity(cityStr) {
-    const city = String(cityStr || '').trim();
-    if (!city) return false;
-    return CONFIG.LOCAL_CITIES.some(lc => city === lc || city.startsWith(lc));
+  // ── Which CONFIG.CITIES entry a city belongs to (null = far city) ──
+  function normalizeText(s) {
+    return String(s || '').replace(/["'״׳`]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+  function classifyCity(cityStr) {
+    const city = normalizeText(cityStr);
+    if (!city) return null;
+    for (const entry of CONFIG.CITIES) {
+      for (const alias of entry.aliases) {
+        const a = normalizeText(alias);
+        // whole word only: "ביתר עילית" ✓, "ירושלים - קרית משה" ✓, "קסריה" ✗ for ק"ס
+        if (city === a || (city.startsWith(a) && !/[a-zא-ת]/.test(city[a.length]))) return entry;
+      }
+    }
+    if (/[a-z]/.test(city)) return CONFIG.CITIES.find(e => e.abroad) || null;   // "London", "Antwerp"…
+    return null;
   }
 
-  // ── Cities that must be ready one working day before delivery (ק"ס etc.) ──
-  function normalizeCity(s) {
-    return String(s || '').replace(/["'״׳]/g, '').replace(/\s+/g, ' ').trim();
+  // ── Earliest deadline (minutes after midnight) written in a note, or null ──
+  //  "עד 12", "עד השעה 14:30", "עד 1 בצהריים" (1–6 = afternoon), "11:00"; no hour but
+  //  "בוקר" / "מוקדם" / "צהריים" counts as 12:00. Dates like "עד ה28/10" or "07.09" are ignored.
+  function parseDeadline(text) {
+    const s = String(text || '');
+    if (!s.trim()) return null;
+    let best = null;
+    const consider = (h, min, after) => {
+      if (h >= 1 && h <= 6 && !/^\s*ב?בוקר/.test(after)) h += 12;
+      if (h > 23 || min > 59) return;
+      const m = h * 60 + min;
+      if (best === null || m < best) best = m;
+    };
+    for (const m of s.matchAll(/(\d{1,2}):(\d{2})/g)) consider(+m[1], +m[2], s.slice(m.index + m[0].length));
+    for (const m of s.matchAll(/עד\s*(?:ה?שעה\s*)?(\d{1,2})(?![\d:]|[\/.]\d)/g)) consider(+m[1], 0, s.slice(m.index + m[0].length));
+    if (best === null && /בוקר|מוקדם|צהר[י]{0,2}ם/.test(s)) best = 12 * 60;
+    return best;
   }
-  function isDayBeforeCity(cityStr) {
-    const city = normalizeCity(cityStr);
-    if (!city) return false;
-    return CONFIG.DAY_BEFORE_CITIES.some(alias => {
-      const a = normalizeCity(alias);
-      return city === a || city.startsWith(a + ' ') || city.startsWith(a + '-');
-    });
+  function formatMinutes(m) {
+    return `${Math.floor(m / 60)}:${String(m % 60).padStart(2, '0')}`;
+  }
+
+  // ── A day written in a note: a date ("שיצא למשלוח ב21/10", "משלוח ל20.10")
+  //    or a weekday ("דחוף רביעי משלוח") → { date, arrival } or null ──
+  //  date:    an explicit date wins; a weekday means the nearest one from today (today counts).
+  //  arrival: true when the note says when it reaches the customer
+  //           ("אצל הלקוח", "שיגיע ללקוח", "בחנות") — the shipping lead time is then subtracted.
+  const WEEKDAYS = [
+    { re: 'ראשון(?!\\s*לציון)', dow: 0 },
+    { re: 'שני',                dow: 1 },
+    { re: 'של[י]?שי',           dow: 2 },
+    { re: 'רביע[י]?',           dow: 3 },
+    { re: 'חמ[י]?ש[י]?',        dow: 4 },
+  ];
+  function parseNoteDay(text, today) {
+    const s = String(text || '');
+    if (!s.trim()) return null;
+    // "שיצא" / "להוציא" / "לצאת" always means the exit day, even if arrival is mentioned too
+    const arrival = /אצל\s*ה?לקוח|שיגיע|ללקוח|בחנות/.test(s) && !/שיצא|להוציא|לצאת/.test(s);
+
+    // Explicit date dd/mm or dd.mm (optional year) — the year closest to today
+    for (const m of s.matchAll(/(?<!\d)(\d{1,2})[\/.](\d{1,2})(?:[\/.](\d{2,4}))?(?!\d)/g)) {
+      const day = +m[1], month = +m[2];
+      if (day < 1 || day > 31 || month < 1 || month > 12) continue;
+      let year = m[3] ? +m[3] : null;
+      if (year !== null && year < 100) year += 2000;
+      const candidates = year !== null ? [year] : [today.getFullYear() - 1, today.getFullYear(), today.getFullYear() + 1];
+      let best = null;
+      for (const y of candidates) {
+        const d = new Date(y, month - 1, day);
+        if (d.getMonth() !== month - 1) continue;           // e.g. 31/02
+        if (!best || Math.abs(d - today) < Math.abs(best - today)) best = d;
+      }
+      if (best) return { date: best, arrival };
+    }
+
+    // Weekday (with ב/ל/ה/יום prefixes) — the nearest one from today
+    for (const w of WEEKDAYS) {
+      const re = new RegExp(`(?:^|[^\\u05D0-\\u05EA])(?:[בלה]|יום\\s*)?${w.re}(?![\\u05D0-\\u05EA])`);
+      if (re.test(s)) {
+        const d = new Date(today);
+        d.setDate(d.getDate() + (w.dow - today.getDay() + 7) % 7);
+        return { date: d, arrival };
+      }
+    }
+    return null;
+  }
+
+  // ── Position of an order inside its day ──
+  const DAY_RANKS = ['before-first', 'first', 'before-far', 'far', 'after-far', 'last',
+                     'after-deliveries', 'other', 'self-pickup', 'pickup'];
+  function dayPosition({ desc, cityEntry, hasCity, deadline }) {
+    // A deadline doesn't move far-city deliveries — they always go with the far group
+    const isFarDelivery = /משלוח/.test(desc) && !/איסוף/.test(desc) && hasCity && !cityEntry;
+    const timeSlot = (deadline === null || isFarDelivery) ? null : CONFIG.TIME_SLOTS.find(t => deadline <= t.upTo);
+    if (timeSlot) return { rank: DAY_RANKS.indexOf(timeSlot.slot), sub: deadline };
+
+    const d = normalizeText(desc);
+    if (d.includes('איסוף עצמי')) return { rank: DAY_RANKS.indexOf('self-pickup'), sub: 0 };
+    const pickupIdx = CONFIG.PICKUP_ORDER.findIndex(p => d.includes(normalizeText(p)));
+    if (pickupIdx >= 0) return { rank: DAY_RANKS.indexOf('pickup'), sub: pickupIdx };
+    if (d.includes('משלוח') && !d.includes('איסוף') && hasCity) {
+      if (!cityEntry) return { rank: DAY_RANKS.indexOf('far'), sub: 0 };
+      return { rank: DAY_RANKS.indexOf(cityEntry.group), sub: cityEntry.order };
+    }
+    return { rank: DAY_RANKS.indexOf('other'), sub: 0 };   // empty / unknown description
   }
 
   // ── Go back N working days (Sun–Thu) from a date ──
@@ -821,7 +940,7 @@
       // Locate header row and relevant columns
       let orderCol = -1, deliveryCol = -1, baseDateCol = -1,
           branchCol = -1, agentCol = -1, descCol = -1,
-          cityAddrCol = -1, cityCol2 = -1, headerRow = -1;
+          cityAddrCol = -1, cityCol2 = -1, detailsCol = -1, courierCol = -1, headerRow = -1;
 
       for (let r = 0; r < Math.min(15, rows.length); r++) {
         const row = rows[r];
@@ -837,6 +956,9 @@
           // City columns: "עיר-כתובת" (primary), "עיר" (fallback)
           if (cityAddrCol < 0 && cell.includes('עיר') && cell.includes('כתובת')) cityAddrCol = c;
           if (cityCol2    < 0 && (cell === 'עיר' || cell === ' עיר')) cityCol2 = c;
+          // Notes that may hold a deadline ("עד 12")
+          if (detailsCol  < 0 && cell === 'פרטים') detailsCol = c;
+          if (courierCol  < 0 && cell.includes('הוראות') && cell.includes('שליח')) courierCol = c;
         }
         if (orderCol >= 0 && deliveryCol >= 0) { headerRow = r; break; }
       }
@@ -847,12 +969,22 @@
       }
 
       deliveryMap = {};
+      notesMap = {};
       let matchCount = 0, skippedCount = 0;
+      const today = new Date(); today.setHours(0, 0, 0, 0);   // weekdays in notes count from today
 
       for (let r = headerRow + 1; r < rows.length; r++) {
         const row = rows[r];
         const order = String(row[orderCol] || '').trim().toUpperCase();
         if (!order) continue;
+
+        // הערות ("פרטים" + "הוראות לשליח") — מוצגות ליד הקובץ, ושעה בהן משפיעה על הסדר
+        const details  = detailsCol >= 0 ? String(row[detailsCol] || '').trim() : '';
+        const courier  = courierCol >= 0 ? String(row[courierCol] || '').trim() : '';
+        const deadline = [parseDeadline(details), parseDeadline(courier)]
+          .filter(m => m !== null).reduce((a, b) => Math.min(a, b), Infinity);
+        const note = { details, courier, deadline: deadline === Infinity ? null : deadline };
+        if (details || courier) notesMap[order] = note;
 
         const deliveryVal  = row[deliveryCol];
         const baseDateVal  = baseDateCol >= 0 ? row[baseDateCol]  : null;
@@ -867,30 +999,36 @@
 
         if (skipDelivery) { skippedCount++; continue; }
 
-        const deliveryDate = toLocalDate(deliveryVal);
-        if (!deliveryDate) continue;
-
-        // עדיפות לפי תאור משלוח (0=משלוח, 1=איסוף עצמי, 2=שאר)
         const descVal = descCol >= 0 ? String(row[descCol] || '').trim() : '';
-        let prio = 2;
-        if (descVal.includes('משלוח') && !descVal.includes('איסוף')) prio = 0;
-        else if (descVal.includes('איסוף עצמי'))                      prio = 1;
+        const isDelivery = descVal.includes('משלוח') && !descVal.includes('איסוף');
 
-        // ── מיון לפי היום שבו ההזמנה צריכה לצאת (רק למשלוחים) ──
-        //  ק"ס / מודיעין עילית → יום עבודה אחד לפני האספקה
-        //  עיר קרובה           → תאריך האספקה עצמו
-        //  עיר רחוקה           → 3 ימי עבודה לפני האספקה
-        let effectiveDate = deliveryDate;
-        if (prio === 0) {
-          // קבל עיר מ"עיר-כתובת"; אם ריק — מ"עיר"
-          const cityRaw = cityAddrCol >= 0 ? String(row[cityAddrCol] || '').trim() : '';
-          const city    = cityRaw || (cityCol2 >= 0 ? String(row[cityCol2] || '').trim() : '');
+        // קבל עיר מ"עיר-כתובת"; אם ריק — מ"עיר"
+        const cityRaw   = cityAddrCol >= 0 ? String(row[cityAddrCol] || '').trim() : '';
+        const city      = cityRaw || (cityCol2 >= 0 ? String(row[cityCol2] || '').trim() : '');
+        const cityEntry = classifyCity(city);
 
-          if (isDayBeforeCity(city))        effectiveDate = subtractWorkingDays(deliveryDate, CONFIG.DAY_BEFORE_DAYS);
-          else if (city && !isLocalCity(city)) effectiveDate = subtractWorkingDays(deliveryDate, CONFIG.FAR_CITY_SHIPPING_DAYS);
-        }
+        // זמן המשלוח (ימי עבודה) — לפי CONFIG.CITIES (ק"ס: 1); עיר רחוקה: 3; איסוף: 0
+        const lead = (isDelivery && city)
+          ? (cityEntry ? cityEntry.leadDays : CONFIG.FAR_CITY_SHIPPING_DAYS) : 0;
+        const exitFromArrival = d => lead ? subtractWorkingDays(d, lead) : d;
 
-        deliveryMap[order] = { date: toDateKey(effectiveDate), prio };
+        // ── היום שבו ההזמנה צריכה לצאת ──
+        //  יום/תאריך שכתוב בהערה גובר על האקסל ("שיצא ב21/10", "דחוף רביעי");
+        //  "אצל הלקוח" / "שיגיע ללקוח" = יום ההגעה, ממנו מורידים את זמן המשלוח.
+        const noteExits = [parseNoteDay(details, today), parseNoteDay(courier, today)]
+          .filter(Boolean)
+          .map(nd => nd.arrival ? exitFromArrival(nd.date) : nd.date);
+        const deliveryDate = toLocalDate(deliveryVal);
+
+        let effectiveDate;
+        if (noteExits.length)  effectiveDate = noteExits.reduce((a, b) => (a <= b ? a : b));
+        else if (deliveryDate) effectiveDate = exitFromArrival(deliveryDate);
+        else continue;
+
+        // ── המקום בתוך היום (שעה מההערות, סוג משלוח, עיר) ──
+        const pos = dayPosition({ desc: descVal, cityEntry, hasCity: !!city, deadline: note.deadline });
+
+        deliveryMap[order] = { date: toDateKey(effectiveDate), rank: pos.rank, sub: pos.sub };
         matchCount++;
       }
 
@@ -900,6 +1038,7 @@
       excelInfo.textContent = `✅ ${file.name} · ${matchCount} הזמנות${skipNote}`;
       excelUploadBtn.textContent = '🔄 החלף אקסל';
       dateSortBtn.disabled = false;
+      refreshNoteBadges();
       hideAlert();
 
     } catch (e) {
@@ -910,31 +1049,49 @@
   // ── Clear Excel ──
   function clearExcel() {
     deliveryMap = {};
+    notesMap = {};
     excelLoaded = false;
     excelLoadedRow.classList.remove('visible');
     excelInfo.textContent = '';
     excelUploadBtn.textContent = '📎 בחר אקסל';
     dateSortBtn.disabled = true;
+    refreshNoteBadges();
   }
 
-  // ── Sort files by delivery date from Excel ──
+  // ── Show the Excel notes ("פרטים" / "הוראות לשליח") next to each file ──
+  function refreshNoteBadges() {
+    fileListEl.querySelectorAll('.file-item').forEach(itemEl => {
+      itemEl.querySelector('.note-badge')?.remove();
+      const entry = files.find(f => f.id === +itemEl.dataset.id);
+      const so    = entry && extractSOFromName(entry.name);
+      const note  = so && notesMap[so];
+      if (!note) return;
+
+      const text = [note.details, note.courier].filter(Boolean).join(' · ');
+      const nb = document.createElement('span');
+      nb.className = 'note-badge' + (note.deadline !== null ? ' timed' : '');
+      nb.title = [note.details && `פרטים: ${note.details}`, note.courier && `הוראות לשליח: ${note.courier}`]
+        .filter(Boolean).join('\n');
+      nb.textContent = (note.deadline !== null ? `⏰ ${formatMinutes(note.deadline)} · ` : '📝 ') + text;
+      itemEl.querySelector('.file-info').appendChild(nb);
+    });
+  }
+
+  // ── Sort files by the day each order must go out, then its position inside that day ──
+  //  (see CONFIG.CITIES, PICKUP_ORDER, TIME_SLOTS). Files not in the Excel go last.
   function sortByDeliveryDate() {
     if (!excelLoaded) return;
-    const FALLBACK_DATE = '9999-99-99';
-    const FALLBACK_PRIO = 99;
+    const FALLBACK = { date: '9999-99-99', rank: 99, sub: 0 };
     files.sort((a, b) => {
-      const soA  = extractSOFromName(a.name);
-      const soB  = extractSOFromName(b.name);
-      const infoA = soA ? deliveryMap[soA] : null;
-      const infoB = soB ? deliveryMap[soB] : null;
-      const dateA = infoA ? infoA.date : FALLBACK_DATE;
-      const dateB = infoB ? infoB.date : FALLBACK_DATE;
-      if (dateA !== dateB) return dateA.localeCompare(dateB);
-      // Same date → sort by delivery description priority
-      const prioA = infoA ? infoA.prio : FALLBACK_PRIO;
-      const prioB = infoB ? infoB.prio : FALLBACK_PRIO;
-      if (prioA !== prioB) return prioA - prioB;
-      // Same priority → natural sort by name
+      const soA = extractSOFromName(a.name) || '';
+      const soB = extractSOFromName(b.name) || '';
+      const A = deliveryMap[soA] || FALLBACK;
+      const B = deliveryMap[soB] || FALLBACK;
+      if (A.date !== B.date) return A.date.localeCompare(B.date);
+      if (A.rank !== B.rank) return A.rank - B.rank;
+      if (A.sub  !== B.sub)  return A.sub  - B.sub;      // city order / pickup order / deadline
+      if (soA    !== soB)    return soA.localeCompare(soB);   // same group → by order number
+      // Same order (confirmation + annex) → keep them adjacent, natural name order
       return naturalSortKey(a.name).localeCompare(naturalSortKey(b.name));
     });
     files.forEach(entry => {
@@ -1080,6 +1237,7 @@
       updateSummaryBadges();
     }
 
+    refreshNoteBadges();
     prefetchLayouts();   // background: annex-merge measurements
   }
 
@@ -1426,6 +1584,7 @@
       updateSummaryBadges();
 
       for (const newEntry of newEntries) addKeywordBadges(newEntry);
+      refreshNoteBadges();
       prefetchLayouts();   // background: annex-merge measurements
 
     } catch (e) {
