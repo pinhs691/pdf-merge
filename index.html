@@ -379,6 +379,15 @@
       background-position: right center;
       box-shadow: 0 12px 28px rgba(12,166,120,0.38);
     }
+    .btn-summary {
+      width: 100%; margin-top: 10px; padding: 11px 24px;
+      background: white; color: var(--navy);
+      border: 1.5px solid var(--border); border-radius: 50px;
+      font-family: inherit; font-size: 0.95rem; font-weight: 700;
+      cursor: pointer; transition: all 0.15s;
+    }
+    .btn-summary:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); background: var(--accent-light); }
+    .btn-summary:disabled { opacity: 0.6; cursor: wait; }
     .btn-merge .spinner {
       width: 18px; height: 18px;
       border: 2.5px solid rgba(255,255,255,0.35); border-top-color: white;
@@ -552,6 +561,10 @@
         <input type="checkbox" id="optOpenAfter">
         פתח בדפדפן לאחר מיזוג
       </label>
+      <label class="checkbox-label" title="דורש קובץ אקסל">
+        <input type="checkbox" id="optSummaryFirst">
+        סיכום דחיפויות כעמוד ראשון במיזוג
+      </label>
     </div>
 
     <div class="progress-wrap" id="progressWrap">
@@ -572,6 +585,7 @@
       <div class="spinner" id="annexSpinner"></div>
       <span id="mergeAnnexBtnText">📑 מזג אישור ונספח</span>
     </button>
+    <button class="btn-summary" id="summaryBtn" type="button">📋 הורד סיכום דחיפויות</button>
   </div>
 
   <!-- Result -->
@@ -682,6 +696,8 @@
   let mergedObjectUrl = null;
   let deliveryMap = {};       // SO_NUMBER → { date: 'YYYY-MM-DD' (day it goes out), rank, sub }
   let notesMap = {};          // SO_NUMBER → { details, courier, deadline } from the Excel
+  let ordersInfo = {};        // SO_NUMBER → everything the urgency summary shows (every Excel row)
+  let excelFileName = '';
   let excelLoaded = false;
 
   // ── Elements ──
@@ -722,6 +738,8 @@
   const optAutoSort    = document.getElementById('optAutoSort');
   const optAutoDownload= document.getElementById('optAutoDownload');
   const optOpenAfter   = document.getElementById('optOpenAfter');
+  const optSummaryFirst= document.getElementById('optSummaryFirst');
+  const summaryBtn     = document.getElementById('summaryBtn');
 
   // ── Sortable ──
   sortableInst = new Sortable(fileListEl, {
@@ -766,6 +784,7 @@
   excelClearBtn.addEventListener('click', clearExcel);
   mergeBtn.addEventListener('click', () => runMerge(false));
   mergeAnnexBtn.addEventListener('click', () => runMerge(true));
+  summaryBtn.addEventListener('click', downloadSummary);
   mergeAgainBtn.addEventListener('click', () => {
     resultSection.classList.remove('visible');
     fileListCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -835,6 +854,13 @@
       if (best === null || m < best) best = m;
     };
     for (const m of s.matchAll(/(\d{1,2}):(\d{2})/g)) consider(+m[1], +m[2], s.slice(m.index + m[0].length));
+    // "11.3בבוקר" / "11.30" — a dot time: followed by בוקר/צהריים/ערב, or minutes that can't be a month
+    for (const m of s.matchAll(/(?<![\d\/.])(\d{1,2})\.(\d{1,2})(?![\d\/.])/g)) {
+      const after = s.slice(m.index + m[0].length);
+      if (/^\s*ב?(בוקר|צהר|ערב)/.test(after) || +m[2] > 12) {
+        consider(+m[1], m[2].length === 1 ? +m[2] * 10 : +m[2], after);
+      }
+    }
     for (const m of s.matchAll(/עד\s*(?:ה?שעה\s*)?(\d{1,2})(?![\d:]|[\/.]\d)/g)) consider(+m[1], 0, s.slice(m.index + m[0].length));
     if (best === null && /בוקר|מוקדם|צהר[י]{0,2}ם/.test(s)) best = 12 * 60;
     return best;
@@ -855,6 +881,7 @@
     { re: 'רביע[י]?',           dow: 3 },
     { re: 'חמ[י]?ש[י]?',        dow: 4 },
   ];
+  const NOTE_DATE_MAX_DAYS = 75;
   function parseNoteDay(text, today) {
     const s = String(text || '');
     if (!s.trim()) return null;
@@ -865,6 +892,8 @@
     for (const m of s.matchAll(/(?<!\d)(\d{1,2})[\/.](\d{1,2})(?:[\/.](\d{2,4}))?(?!\d)/g)) {
       const day = +m[1], month = +m[2];
       if (day < 1 || day > 31 || month < 1 || month > 12) continue;
+      // "עד 11.3בבוקר" is a time (11:30), not a date
+      if (/^\s*ב?(בוקר|צהר|ערב)/.test(s.slice(m.index + m[0].length))) continue;
       let year = m[3] ? +m[3] : null;
       if (year !== null && year < 100) year += 2000;
       const candidates = year !== null ? [year] : [today.getFullYear() - 1, today.getFullYear(), today.getFullYear() + 1];
@@ -874,7 +903,8 @@
         if (d.getMonth() !== month - 1) continue;           // e.g. 31/02
         if (!best || Math.abs(d - today) < Math.abs(best - today)) best = d;
       }
-      if (best) return { date: best, arrival };
+      // A note's date is about this order — ignore anything far from today (a misread number)
+      if (best && Math.abs(best - today) <= NOTE_DATE_MAX_DAYS * 86400000) return { date: best, arrival };
     }
 
     // Weekday (with ב/ל/ה/יום prefixes) — the nearest one from today
@@ -887,6 +917,15 @@
       }
     }
     return null;
+  }
+
+  // ── Kind of order, for the summary counts ──
+  function orderType(desc) {
+    const d = normalizeText(desc);
+    if (d.includes('איסוף עצמי')) return 'self';
+    if (d.includes('איסוף'))      return 'store';
+    if (d.includes('משלוח'))      return 'delivery';
+    return 'other';
   }
 
   // ── Position of an order inside its day ──
@@ -940,7 +979,7 @@
       // Locate header row and relevant columns
       let orderCol = -1, deliveryCol = -1, baseDateCol = -1,
           branchCol = -1, agentCol = -1, descCol = -1,
-          cityAddrCol = -1, cityCol2 = -1, detailsCol = -1, courierCol = -1, headerRow = -1;
+          cityAddrCol = -1, cityCol2 = -1, detailsCol = -1, courierCol = -1, customerCol = -1, headerRow = -1;
 
       for (let r = 0; r < Math.min(15, rows.length); r++) {
         const row = rows[r];
@@ -959,6 +998,8 @@
           // Notes that may hold a deadline ("עד 12")
           if (detailsCol  < 0 && cell === 'פרטים') detailsCol = c;
           if (courierCol  < 0 && cell.includes('הוראות') && cell.includes('שליח')) courierCol = c;
+          // For the urgency summary
+          if (customerCol < 0 && cell.includes('שם לקוח')) customerCol = c;
         }
         if (orderCol >= 0 && deliveryCol >= 0) { headerRow = r; break; }
       }
@@ -970,6 +1011,8 @@
 
       deliveryMap = {};
       notesMap = {};
+      ordersInfo = {};
+      excelFileName = file.name;
       let matchCount = 0, skippedCount = 0;
       const today = new Date(); today.setHours(0, 0, 0, 0);   // weekdays in notes count from today
 
@@ -997,8 +1040,6 @@
           CONFIG.SKIP_RULES.some(rule =>
             fields[rule.field] === rule.value && daysDiff(baseDateVal, deliveryVal) === rule.daysAfterBase);
 
-        if (skipDelivery) { skippedCount++; continue; }
-
         const descVal = descCol >= 0 ? String(row[descCol] || '').trim() : '';
         const isDelivery = descVal.includes('משלוח') && !descVal.includes('איסוף');
 
@@ -1006,6 +1047,18 @@
         const cityRaw   = cityAddrCol >= 0 ? String(row[cityAddrCol] || '').trim() : '';
         const city      = cityRaw || (cityCol2 >= 0 ? String(row[cityCol2] || '').trim() : '');
         const cityEntry = classifyCity(city);
+
+        // פרטים לסיכום הדחיפויות (נשמר לכל הזמנה, גם לכאלה בלי תאריך או שדולגו)
+        const info = ordersInfo[order] = {
+          customer: customerCol >= 0 ? String(row[customerCol] || '').trim() : '',
+          agent, desc: descVal, city, details, courier, deadline: note.deadline,
+          type: orderType(descVal),
+          isFar: isDelivery && !!city && !cityEntry,
+          deliveryDate: null, excelExit: null, exitDate: null,
+          status: skipDelivery ? 'skipped' : 'nodate',
+        };
+
+        if (skipDelivery) { skippedCount++; continue; }
 
         // זמן המשלוח (ימי עבודה) — לפי CONFIG.CITIES (ק"ס: 1); עיר רחוקה: 3; איסוף: 0
         const lead = (isDelivery && city)
@@ -1024,6 +1077,14 @@
         if (noteExits.length)  effectiveDate = noteExits.reduce((a, b) => (a <= b ? a : b));
         else if (deliveryDate) effectiveDate = exitFromArrival(deliveryDate);
         else continue;
+
+        Object.assign(info, {
+          deliveryDate,
+          excelExit: deliveryDate ? exitFromArrival(deliveryDate) : null,   // without the notes
+          exitDate: effectiveDate,
+          lead,
+          status: 'dated',
+        });
 
         // ── המקום בתוך היום (שעה מההערות, סוג משלוח, עיר) ──
         const pos = dayPosition({ desc: descVal, cityEntry, hasCity: !!city, deadline: note.deadline });
@@ -1050,6 +1111,8 @@
   function clearExcel() {
     deliveryMap = {};
     notesMap = {};
+    ordersInfo = {};
+    excelFileName = '';
     excelLoaded = false;
     excelLoadedRow.classList.remove('visible');
     excelInfo.textContent = '';
@@ -2001,19 +2064,44 @@
 
     try {
       const merged = await PDFLib.PDFDocument.create();
+      // First page of each order in the merged file — for the summary's page column
+      const pageOf = {};
+      const notePage = entry => {
+        const so = extractSOFromName(entry.name);
+        if (so && !(so in pageOf)) pageOf[so] = merged.getPageCount() + 1;
+      };
 
       if (annexMode) {
-        await appendAnnexMode(merged, files, false, (i, entry) =>
-          setProgress(Math.round((i / files.length) * 86), `מעבד: ${truncate(entry.name, 35)}`));
+        await appendAnnexMode(merged, files, false, (i, entry) => {
+          notePage(entry);
+          setProgress(Math.round((i / files.length) * 86), `מעבד: ${truncate(entry.name, 35)}`);
+        });
       } else {
         for (let i = 0; i < files.length; i++) {
           const entry = files[i];
           setProgress(Math.round((i / files.length) * 88), `מעבד קובץ ${i + 1} מתוך ${files.length}: ${truncate(entry.name, 35)}`);
+          notePage(entry);
           await appendEntryPages(merged, entry);
         }
       }
 
       await appendEngravingCopies(merged, annexMode);
+
+      // Urgency summary as the first page(s). Page numbers shift by the summary's own length,
+      // so it is drawn once to count its pages, then again with the final numbers.
+      let summaryNote = '';
+      if (optSummaryFirst.checked) {
+        if (excelLoaded) {
+          setProgress(93, 'מוסיף סיכום דחיפויות...');
+          const model = buildSummaryModel();
+          const shifted = n => Object.fromEntries(Object.entries(pageOf).map(([so, p]) => [so, p + n]));
+          const count = (await renderSummaryPages(model, shifted(0))).length;
+          await addSummaryPages(merged, await renderSummaryPages(model, shifted(count)), 0);
+          summaryNote = ` · כולל ${count} עמודי סיכום`;
+        } else {
+          summaryNote = ' · בלי סיכום (לא נטען אקסל)';
+        }
+      }
 
       setProgress(95, 'שומר קובץ...');
       const pdfBytes = await merged.save();
@@ -2027,7 +2115,7 @@
       const outName = (document.getElementById('outputName').value.trim() || 'מיזוג') + '.pdf';
       downloadLink.href     = mergedObjectUrl;
       downloadLink.download = outName;
-      resultText.textContent = `${files.length} קבצים מוזגו · ${merged.getPageCount()} עמודים · ${formatSize(pdfBytes.length)}`;
+      resultText.textContent = `${files.length} קבצים מוזגו · ${merged.getPageCount()} עמודים · ${formatSize(pdfBytes.length)}${summaryNote}`;
 
       // Auto-download
       if (optAutoDownload.checked) {
@@ -2052,6 +2140,429 @@
     }
 
     setMerging(false, annexMode);
+  }
+
+  // ══════════════════════════════════════════════════════════════
+  //  Urgency summary (סיכום דחיפויות) — A4 report of what goes out on which day
+  // ══════════════════════════════════════════════════════════════
+  const HEB_DAYS        = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'];
+  const HEB_DAY_LETTERS = ['א', 'ב', 'ג', 'ד', 'ה', 'ו', 'ש'];
+  const shortDate = d => `${HEB_DAY_LETTERS[d.getDay()]} ${d.getDate()}/${d.getMonth() + 1}`;
+  const longDate  = d => `${HEB_DAYS[d.getDay()]} ${d.getDate()}/${d.getMonth() + 1}`;
+  const TYPE_LABELS = { delivery: 'משלוחים', self: 'איסוף עצמי', store: 'איסוף מחנויות', other: 'אחר' };
+  const MISSING_MAX_ROWS = 40;
+
+  // ── What the summary shows: the orders in the file list, grouped by exit day,
+  //    plus urgent Excel orders (overdue / today / tomorrow) that have no PDF in the list ──
+  function buildSummaryModel() {
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today); tomorrow.setDate(tomorrow.getDate() + 1);
+    const todayKey = toDateKey(today), tomorrowKey = toDateKey(tomorrow);
+
+    // Unique orders in the list (a confirmation and its annex are one order)
+    const listed = new Map();
+    const notInExcel = [];
+    for (const f of files) {
+      const so = extractSOFromName(f.name);
+      if (!so) { notInExcel.push(f.name); continue; }
+      const o = listed.get(so) || { so, engraving: false };
+      o.engraving = o.engraving || !!f.hasEngraving;
+      listed.set(so, o);
+    }
+
+    const dated = [], noUrgency = [];
+    for (const o of listed.values()) {
+      const info = ordersInfo[o.so];
+      if (!info) { notInExcel.push(o.so); continue; }
+      const r = { ...o, info, pos: deliveryMap[o.so] };
+      if (info.status === 'dated' && r.pos) dated.push(r); else noUrgency.push(r);
+    }
+
+    const cmp = (a, b) => a.pos.date.localeCompare(b.pos.date) || a.pos.rank - b.pos.rank ||
+                          a.pos.sub - b.pos.sub || a.so.localeCompare(b.so);
+    dated.sort(cmp);
+
+    const overdue = dated.filter(r => r.pos.date < todayKey);
+    const days = [];
+    for (const r of dated) {
+      if (r.pos.date < todayKey) continue;
+      let day = days[days.length - 1];
+      if (!day || day.key !== r.pos.date) {
+        const d = r.info.exitDate;
+        day = { key: r.pos.date, rows: [],
+                label: r.pos.date === todayKey ? `היום · ${longDate(d)}` : r.pos.date === tomorrowKey ? `מחר · ${longDate(d)}` : longDate(d),
+                short: r.pos.date === todayKey ? 'היום' : r.pos.date === tomorrowKey ? 'מחר' : shortDate(d) };
+        days.push(day);
+      }
+      day.rows.push(r);
+    }
+
+    const missing = Object.entries(ordersInfo)
+      .filter(([so, info]) => info.status === 'dated' && !listed.has(so) && deliveryMap[so] && deliveryMap[so].date <= tomorrowKey)
+      .map(([so, info]) => ({ so, info, pos: deliveryMap[so], engraving: false }))
+      .sort(cmp);
+
+    const all = [...dated, ...noUrgency];
+    const byType = { delivery: 0, self: 0, store: 0, other: 0 };
+    const agents = {};
+    all.forEach(r => {
+      byType[r.info.type]++;
+      const a = r.info.agent || 'בלי סוכן';
+      agents[a] = (agents[a] || 0) + 1;
+    });
+
+    return {
+      today, todayKey, tomorrowKey, overdue, days, noUrgency, notInExcel, missing, byType,
+      total: listed.size, engravings: all.filter(r => r.engraving).length,
+      agents: Object.entries(agents).sort((a, b) => b[1] - a[1]),
+    };
+  }
+
+  // ── Draw the summary as A4 page canvases ──
+  //  Drawn with Canvas, which lays out Hebrew + numbers + English correctly (pdf-lib can't).
+  //  pageOf: SO → page number in the merged file (only when the summary goes into a merge).
+  const SUMMARY_FONT = '"Heebo", Arial, sans-serif';
+  const SUMMARY_COLORS = {
+    navy: '#1e3a5f', accent: '#3b5bdb', text: '#1a2742', muted: '#6b7a99', faint: '#9aa6bf',
+    line: '#e9edf5', zebra: '#f8faff', box: '#f3f5fb', border: '#e1e7f2', onNavy: '#c5d3ea',
+    red: '#c92a2a', redBg: '#fff0f0', amber: '#a64d00', amberBg: '#fff4d6',
+    blue: '#1c5bd8', blueBg: '#eaf1ff', green: '#0c8a64', greenBg: '#e6fcf5',
+    purple: '#6741d9', purpleBg: '#f3f0ff', gray: '#868e96', grayBg: '#f1f3f5',
+  };
+  async function renderSummaryPages(model, pageOf = null) {
+    if (document.fonts) {
+      await Promise.all(['400', '500', '700', '800'].map(w => document.fonts.load(`${w} 12px Heebo`).catch(() => {})));
+    }
+    const C = SUMMARY_COLORS;
+    const TYPE_COLOR = { delivery: C.blue, self: C.green, store: C.purple, other: C.gray };
+    const PW = 595, PH = 842, M = 26, S = 2.5;          // points; S = pixels per point (≈180 dpi)
+    const BOTTOM = PH - 42, ROW_H = 16;
+    const now = new Date();
+    const stamp = `${now.getHours()}:${String(now.getMinutes()).padStart(2, '0')}`;
+    const dateFull = `${HEB_DAYS[model.today.getDay()]} ${model.today.getDate()}/${model.today.getMonth() + 1}/${model.today.getFullYear()}`;
+
+    // Columns right → left
+    const cols = [['check', '', 16], ...(pageOf ? [['page', "עמ'", 24]] : []), ['so', 'הזמנה', 70],
+                  ['customer', 'לקוח', 120], ['agent', 'סוכן', 62], ['dest', 'יעד', 98], ['note', 'הערה', 0]];
+    cols[cols.length - 1][2] = PW - 2 * M - cols.reduce((s, c) => s + c[2], 0);
+
+    const pages = [];
+    let ctx, y, zebra = false;
+    const font = (size, weight = 400) => { ctx.font = `${weight} ${size}px ${SUMMARY_FONT}`; };
+    const fit = (text, w) => {
+      text = String(text ?? '');
+      if (!w || ctx.measureText(text).width <= w) return text;
+      while (text.length && ctx.measureText(text + '…').width > w) text = text.slice(0, -1);
+      return text + '…';
+    };
+    const textAt = (text, x, yy, w = 0, color = C.text, align = 'right') => {
+      ctx.fillStyle = color; ctx.textAlign = align; ctx.fillText(fit(text, w), x, yy);
+    };
+    const box = (x, yy, w, h, r, fill, stroke = null) => {
+      ctx.beginPath(); ctx.roundRect(x, yy, w, h, r);
+      if (fill)   { ctx.fillStyle = fill; ctx.fill(); }
+      if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 0.6; ctx.stroke(); }
+    };
+    const dot = (cx, cy, r, color) => { ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill(); };
+    const pill = (text, xRight, base, fg, bg) => {        // returns its width
+      const w = ctx.measureText(text).width + 9;
+      box(xRight - w, base - 8.5, w, 12, 6, bg);
+      textAt(text, xRight - 4.5, base, 0, fg);
+      return w;
+    };
+    const wrap = (text, maxW) => {                        // current font
+      const lines = []; let line = '';
+      for (const w of String(text).split(/\s+/)) {
+        const test = line ? line + ' ' + w : w;
+        if (line && ctx.measureText(test).width > maxW) { lines.push(line); line = w; } else line = test;
+      }
+      if (line) lines.push(line);
+      return lines;
+    };
+
+    // ── Pages ──
+    function newPage() {
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(PW * S); canvas.height = Math.round(PH * S);
+      ctx = canvas.getContext('2d');
+      ctx.scale(S, S);
+      ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, PW, PH);
+      ctx.direction = 'rtl';
+      pages.push(canvas);
+      zebra = false;
+      if (pages.length === 1) return;
+      // Continuation: slim band + column header
+      ctx.fillStyle = C.navy; ctx.fillRect(0, 0, PW, 30);
+      ctx.fillStyle = C.accent; ctx.fillRect(0, 30, PW, 2);
+      font(11, 700); textAt('סיכום דחיפויות · המשך', PW - M, 20, 0, '#fff');
+      font(8.5, 400); textAt(dateFull, M, 20, 0, C.onNavy, 'left');
+      y = 44;
+      columnHeader();
+    }
+    const need = h => { if (y + h > BOTTOM) newPage(); };
+
+    function columnHeader() {
+      box(M, y, PW - 2 * M, 17, 4, C.box);
+      font(7.5, 700);
+      let x = PW - M;
+      for (const [, title, w] of cols) { textAt(title, x - 4, y + 11.5, w - 6, C.muted); x -= w; }
+      y += 21;
+    }
+
+    // Day / section header: tinted bar with an accent strip on the right, counts on the left
+    function sectionHeader(title, sub, accent, tint, rows = null) {
+      need(30 + ROW_H);                                   // keep a header with its first row
+      y += 6;
+      box(M, y, PW - 2 * M, 22, 5, tint);
+      ctx.fillStyle = accent; ctx.beginPath(); ctx.roundRect(PW - M - 4, y, 4, 22, [0, 5, 5, 0]); ctx.fill();
+      font(11, 800); textAt(title, PW - M - 12, y + 15, 0, C.navy);
+      const tw = ctx.measureText(title).width;
+      if (sub) { font(8, 400); textAt(sub, PW - M - 12 - tw - 8, y + 15, 0, C.muted); }
+      if (rows) {                                         // "● משלוחים 3  ● איסוף עצמי 2" on the left
+        const t = { delivery: 0, self: 0, store: 0, other: 0 };
+        rows.forEach(r => t[r.info.type]++);
+        let x = M + 8;
+        font(7.5, 500);
+        for (const k of Object.keys(t).reverse()) {
+          if (!t[k]) continue;
+          const label = `${TYPE_LABELS[k]} ${t[k]}`;
+          textAt(label, x, y + 14.5, 0, C.muted, 'left');
+          const w = ctx.measureText(label).width;
+          dot(x + w + 5, y + 11.5, 2.6, TYPE_COLOR[k]);
+          x += w + 16;
+        }
+      }
+      y += 26;
+      zebra = false;
+    }
+
+    function destText(i) {
+      if (i.type === 'delivery') return `${i.city || '—'} · ${i.isFar ? 'רחוק' : 'משלוח'}`;
+      if (i.type === 'self') return 'איסוף עצמי';
+      return i.desc || '—';
+    }
+
+    function noteCell(r, kind, xRight, base, width) {
+      const i = r.info, left = xRight - width;
+      const pills = [];
+      if (kind !== 'day' && i.exitDate) pills.push([`יציאה ${shortDate(i.exitDate)}`, C.red, C.redBg]);
+      if (i.deadline !== null && i.deadline !== undefined) pills.push([`עד ${formatMinutes(i.deadline)}`, C.amber, C.amberBg]);
+      if (i.excelExit && i.exitDate && toDateKey(i.excelExit) !== toDateKey(i.exitDate)) {
+        pills.push([`${i.exitDate < i.excelExit ? 'הוקדם' : 'נדחה'} מ-${shortDate(i.excelExit)}`, C.blue, C.blueBg]);
+      }
+      if (i.isFar && kind === 'day' && r.pos.date <= model.tomorrowKey) pills.push(['חייב לצאת', C.red, C.redBg]);
+      if (r.engraving) pills.push(['הטבעה', C.amber, C.amberBg]);
+
+      let x = xRight;
+      font(7.5, 700);
+      for (const [t, fg, bg] of pills) {
+        if (x - left < ctx.measureText(t).width + 30) break;
+        x -= pill(t, x, base, fg, bg) + 3;
+      }
+      const parts = [];
+      if (i.lead && i.deliveryDate) parts.push(`אספקה ${shortDate(i.deliveryDate)}`);
+      const note = [i.details, i.courier].filter(Boolean).join(' · ');
+      if (note) parts.push(note);
+      font(7.5, 400);
+      if (parts.length && x - left > 14) textAt(parts.join(' · '), x, base, x - left, C.muted);
+    }
+
+    function row(r, kind) {                               // kind: 'overdue' | 'day' | 'missing'
+      need(ROW_H);
+      if (zebra) { ctx.fillStyle = C.zebra; ctx.fillRect(M, y, PW - 2 * M, ROW_H); }
+      zebra = !zebra;
+      const i = r.info, base = y + 11;
+      let x = PW - M;
+      for (const [key, , w] of cols) {
+        const cx = x - 4, cw = w - 6;
+        if (key === 'check') box(x - 12, y + 4, 8, 8, 2, '#fff', C.faint);
+        if (key === 'page')     { font(8, 500); textAt(pageOf[r.so] ?? '', cx, base, cw, C.muted); }
+        if (key === 'so')       { font(8, 700); textAt(r.so, cx, base, cw, C.navy); }
+        if (key === 'customer') { font(8.5, 500); textAt(i.customer || '—', cx, base, cw); }
+        if (key === 'agent')    { font(8, 400); textAt(i.agent || '—', cx, base, cw, C.muted); }
+        if (key === 'dest') {
+          dot(cx - 2.5, y + 8, 2.6, TYPE_COLOR[i.type]);
+          font(8.5, 400); textAt(destText(i), cx - 9, base, cw - 9);
+        }
+        if (key === 'note') noteCell(r, kind, cx, base, cw);
+        x -= w;
+      }
+      y += ROW_H;
+      ctx.strokeStyle = C.line; ctx.lineWidth = 0.5;
+      ctx.beginPath(); ctx.moveTo(M, y); ctx.lineTo(PW - M, y); ctx.stroke();
+    }
+
+    // Soft box with a title and wrapped text (no-urgency list, not-in-Excel list, all-clear)
+    function noteBox(title, text, fg, bg) {
+      font(8, 400);
+      const lines = text ? wrap(text, PW - 2 * M - 24) : [];
+      const h = 22 + lines.length * 11 + (lines.length ? 4 : 0);
+      need(h + 8);
+      y += 6;
+      box(M, y, PW - 2 * M, h, 6, bg);
+      font(9, 700); textAt(title, PW - M - 12, y + 14, 0, fg);
+      font(8, 400);
+      lines.forEach((l, k) => textAt(l, PW - M - 12, y + 27 + k * 11, 0, C.muted));
+      y += h + 2;
+    }
+
+    // ── Page 1: header band ──
+    newPage();
+    ctx.fillStyle = C.navy; ctx.fillRect(0, 0, PW, 78);
+    ctx.fillStyle = C.accent; ctx.fillRect(0, 78, PW, 3);
+    font(22, 800); textAt('סיכום דחיפויות', PW - M, 38, 0, '#fff');
+    font(11, 400); textAt(dateFull, PW - M, 58, 0, C.onNavy);
+    font(26, 800); textAt(String(model.total), M, 40, 0, '#fff', 'left');
+    const totalW = ctx.measureText(String(model.total)).width;
+    font(9, 500); textAt('הזמנות ברשימה', M + totalW + 7, 38, 0, C.onNavy, 'left');
+    font(7.5, 400);
+    // ⁨…⁩ isolates the file name so "x.xlsx" doesn't scramble the Hebrew around it
+    textAt(`הופק ב-${stamp} · ⁨${excelFileName}⁩`, M, 58, 260, C.onNavy, 'left');
+    y = 96;
+
+    // ── Count cards: overdue, each day, no urgency ──
+    const cards = [
+      ['באיחור', model.overdue.length, model.overdue.length ? [C.red, C.redBg] : [C.faint, '#fff']],
+      ...model.days.map(d => [d.short, d.rows.length,
+        d.key === model.todayKey ? [C.amber, C.amberBg] : d.key === model.tomorrowKey ? [C.accent, '#fff'] : [C.faint, '#fff']]),
+      ['בלי דחיפות', model.noUrgency.length, [C.gray, C.grayBg]],
+    ];
+    const GAP = 6, perRow = 8, CW = (PW - 2 * M - GAP * (perRow - 1)) / perRow, CH = 44;
+    cards.forEach(([label, n, [accent, bg]], k) => {
+      if (k && k % perRow === 0) y += CH + GAP;
+      const xr = PW - M - (k % perRow) * (CW + GAP);
+      box(xr - CW, y, CW, CH, 6, bg, C.border);
+      ctx.fillStyle = accent; ctx.beginPath(); ctx.roundRect(xr - CW, y, CW, 3, [6, 6, 0, 0]); ctx.fill();
+      font(7.5, 500); textAt(label, xr - CW / 2, y + 15, CW - 6, C.muted, 'center');
+      font(17, 800); textAt(String(n), xr - CW / 2, y + 36, 0, accent === C.faint ? C.navy : accent, 'center');
+    });
+    y += CH + 10;
+
+    // ── Type chips ──
+    {
+      const chips = [...Object.keys(model.byType).filter(k => model.byType[k])
+                       .map(k => [`${TYPE_LABELS[k]} ${model.byType[k]}`, TYPE_COLOR[k]]),
+                     ...(model.engravings ? [[`הטבעות ${model.engravings}`, C.amber]] : [])];
+      let x = PW - M;
+      font(8, 500);
+      for (const [label, color] of chips) {
+        const w = ctx.measureText(label).width + 20;
+        box(x - w, y, w, 16, 8, C.box);
+        dot(x - 8, y + 8, 3, color);
+        textAt(label, x - 14, y + 11.5, 0, C.text);
+        x -= w + 5;
+      }
+      y += 24;
+    }
+    columnHeader();
+
+    // ── Overdue, then every day ──
+    if (model.overdue.length) {
+      sectionHeader('באיחור', 'היה צריך לצאת לפני היום', C.red, C.redBg, model.overdue);
+      model.overdue.forEach(r => row(r, 'overdue'));
+    }
+    for (const d of model.days) {
+      const isToday = d.key === model.todayKey, isTomorrow = d.key === model.tomorrowKey;
+      const [name, date] = d.label.includes(' · ') ? d.label.split(' · ') : [d.label, ''];
+      const count = d.rows.length === 1 ? 'הזמנה אחת' : `${d.rows.length} הזמנות`;
+      sectionHeader(name, date ? `${date} · ${count}` : count,
+                    isToday ? C.amber : isTomorrow ? C.accent : C.faint,
+                    isToday ? C.amberBg : isTomorrow ? C.blueBg : C.box, d.rows);
+      d.rows.forEach(r => row(r, 'day'));
+    }
+    if (!model.overdue.length && !model.days.length) noteBox('אין הזמנות עם תאריך יציאה', '', C.muted, C.box);
+
+    // ── Bottom: no urgency, not in Excel, urgent without PDF, per agent ──
+    y += 6;
+    if (model.noUrgency.length) {
+      noteBox(`בלי דחיפות · ${model.noUrgency.length} הזמנות`,
+              'בלי תאריך אספקה, או כלל מיוחד: ' + model.noUrgency.map(r => r.so).join(', '), C.gray, C.grayBg);
+    }
+    if (model.notInExcel.length) {
+      noteBox(`לא נמצאו באקסל · ${model.notInExcel.length} קבצים`, model.notInExcel.join(', '), C.amber, C.amberBg);
+    }
+    if (model.missing.length) {
+      sectionHeader('דחופות בלי קובץ PDF', `${model.missing.length} הזמנות מהאקסל שצריכות לצאת עד מחר`, C.red, C.redBg, model.missing);
+      model.missing.slice(0, MISSING_MAX_ROWS).forEach(r => row(r, 'missing'));
+      if (model.missing.length > MISSING_MAX_ROWS) {
+        need(14); font(8, 400); textAt(`ועוד ${model.missing.length - MISSING_MAX_ROWS} הזמנות`, PW - M - 12, y + 11, 0, C.muted); y += 14;
+      }
+    } else {
+      noteBox('לכל ההזמנות הדחופות יש קובץ PDF', '', C.green, C.greenBg);
+    }
+
+    // Per agent: small bar chart
+    if (model.agents.length) {
+      const shown = model.agents.slice(0, 12);
+      const BAR_H = 13, max = Math.max(...shown.map(a => a[1]));
+      need(26 + shown.length * BAR_H);
+      y += 10;
+      font(9, 700); textAt('לפי סוכן', PW - M, y + 9, 0, C.navy);
+      y += 16;
+      const nameW = 90, barMax = 220;
+      for (const [agent, n] of shown) {
+        font(8, 500); textAt(agent, PW - M, y + 9, nameW - 6, C.text);
+        const bw = Math.max(4, barMax * n / max);
+        box(PW - M - nameW - bw, y + 2, bw, 9, 3, C.blueBg);
+        ctx.fillStyle = C.accent; ctx.fillRect(PW - M - nameW - 2, y + 2, 2, 9);
+        font(8, 700); textAt(String(n), PW - M - nameW - bw - 5, y + 9.5, 0, C.navy);
+        y += BAR_H;
+      }
+      if (model.agents.length > shown.length) {
+        font(7.5, 400); textAt(`ועוד ${model.agents.length - shown.length} סוכנים`, PW - M, y + 9, 0, C.muted); y += 12;
+      }
+    }
+
+    // ── Footer on every page ──
+    pages.forEach((canvas, k) => {
+      ctx = canvas.getContext('2d');
+      ctx.setTransform(S, 0, 0, S, 0, 0);
+      ctx.direction = 'rtl';
+      ctx.strokeStyle = C.border; ctx.lineWidth = 0.6;
+      ctx.beginPath(); ctx.moveTo(M, PH - 28); ctx.lineTo(PW - M, PH - 28); ctx.stroke();
+      font(7.5, 400);
+      textAt(`סיכום דחיפויות · ${dateFull} · הופק ב-${stamp}`, PW - M, PH - 16, 0, C.faint);
+      font(7.5, 700);
+      textAt(`עמוד ${k + 1} מתוך ${pages.length}`, M, PH - 16, 0, C.muted, 'left');
+    });
+    return pages;
+  }
+
+  // ── Put summary canvases into a PDF (appended, or inserted from page index `atIndex`) ──
+  async function addSummaryPages(pdfDoc, canvases, atIndex = null) {
+    for (let k = 0; k < canvases.length; k++) {
+      const blob = await new Promise(res => canvases[k].toBlob(res, 'image/png'));
+      const img  = await pdfDoc.embedPng(await blob.arrayBuffer());
+      const page = atIndex === null ? pdfDoc.addPage([595, 842]) : pdfDoc.insertPage(atIndex + k, [595, 842]);
+      page.drawImage(img, { x: 0, y: 0, width: 595, height: 842 });
+    }
+  }
+
+  // ── "הורד סיכום דחיפויות" button ──
+  async function downloadSummary() {
+    hideAlert();
+    if (!excelLoaded) { showAlert('כדי להפיק סיכום דחיפויות צריך קודם לטעון קובץ אקסל'); return; }
+    if (!files.length) return;
+    const label = summaryBtn.textContent;
+    summaryBtn.disabled = true;
+    summaryBtn.textContent = '⏳ מכין סיכום...';
+    try {
+      const doc = await PDFLib.PDFDocument.create();
+      await addSummaryPages(doc, await renderSummaryPages(buildSummaryModel()));
+      const now = new Date();
+      downloadBytes(await doc.save(), `סיכום דחיפויות ${now.getDate()}.${now.getMonth() + 1}.pdf`);
+    } catch (e) {
+      showAlert('שגיאה בהפקת הסיכום: ' + e.message);
+    }
+    summaryBtn.disabled = false;
+    summaryBtn.textContent = label;
+  }
+
+  function downloadBytes(bytes, name) {
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+    const a = document.createElement('a');
+    a.href = url; a.download = name; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
   }
 
   // ── Helpers ──
