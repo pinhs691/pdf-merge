@@ -1034,12 +1034,6 @@
         const branch       = String(row[branchCol]  || '').trim();
         const agent        = agentCol >= 0 ? String(row[agentCol] || '').trim() : '';
 
-        // כללי דילוג (סניף 800 + 7 ימים, שמואל שלמון + 0 ימים) — ראה CONFIG.SKIP_RULES
-        const fields = { branch, agent };
-        const skipDelivery = baseDateVal !== null && deliveryVal !== '' &&
-          CONFIG.SKIP_RULES.some(rule =>
-            fields[rule.field] === rule.value && daysDiff(baseDateVal, deliveryVal) === rule.daysAfterBase);
-
         const descVal = descCol >= 0 ? String(row[descCol] || '').trim() : '';
         const isDelivery = descVal.includes('משלוח') && !descVal.includes('איסוף');
 
@@ -1047,6 +1041,25 @@
         const cityRaw   = cityAddrCol >= 0 ? String(row[cityAddrCol] || '').trim() : '';
         const city      = cityRaw || (cityCol2 >= 0 ? String(row[cityCol2] || '').trim() : '');
         const cityEntry = classifyCity(city);
+
+        // זמן המשלוח (ימי עבודה) — לפי CONFIG.CITIES (ק"ס: 1); עיר רחוקה: 3; איסוף: 0
+        const lead = (isDelivery && city)
+          ? (cityEntry ? cityEntry.leadDays : CONFIG.FAR_CITY_SHIPPING_DAYS) : 0;
+        const exitFromArrival = d => lead ? subtractWorkingDays(d, lead) : d;
+
+        // ── היום שבו ההזמנה צריכה לצאת ──
+        //  יום/תאריך שכתוב בהערה גובר על האקסל ("שיצא ב21/10", "דחוף רביעי");
+        //  "אצל הלקוח" / "שיגיע ללקוח" = יום ההגעה, ממנו מורידים את זמן המשלוח.
+        const noteExits = [parseNoteDay(details, today), parseNoteDay(courier, today)]
+          .filter(Boolean)
+          .map(nd => nd.arrival ? exitFromArrival(nd.date) : nd.date);
+
+        // כללי דילוג (סניף 800 + 7 ימים, שמואל שלמון + 0 ימים) — ראה CONFIG.SKIP_RULES.
+        // יום או תאריך בהערה גוברים על הדילוג ("דחוף משלוח 25/10 עד 12" בהזמנה של סניף 800).
+        const fields = { branch, agent };
+        const skipDelivery = !noteExits.length && baseDateVal !== null && deliveryVal !== '' &&
+          CONFIG.SKIP_RULES.some(rule =>
+            fields[rule.field] === rule.value && daysDiff(baseDateVal, deliveryVal) === rule.daysAfterBase);
 
         // פרטים לסיכום הדחיפויות (נשמר לכל הזמנה, גם לכאלה בלי תאריך או שדולגו)
         const info = ordersInfo[order] = {
@@ -1060,17 +1073,6 @@
 
         if (skipDelivery) { skippedCount++; continue; }
 
-        // זמן המשלוח (ימי עבודה) — לפי CONFIG.CITIES (ק"ס: 1); עיר רחוקה: 3; איסוף: 0
-        const lead = (isDelivery && city)
-          ? (cityEntry ? cityEntry.leadDays : CONFIG.FAR_CITY_SHIPPING_DAYS) : 0;
-        const exitFromArrival = d => lead ? subtractWorkingDays(d, lead) : d;
-
-        // ── היום שבו ההזמנה צריכה לצאת ──
-        //  יום/תאריך שכתוב בהערה גובר על האקסל ("שיצא ב21/10", "דחוף רביעי");
-        //  "אצל הלקוח" / "שיגיע ללקוח" = יום ההגעה, ממנו מורידים את זמן המשלוח.
-        const noteExits = [parseNoteDay(details, today), parseNoteDay(courier, today)]
-          .filter(Boolean)
-          .map(nd => nd.arrival ? exitFromArrival(nd.date) : nd.date);
         const deliveryDate = toLocalDate(deliveryVal);
 
         let effectiveDate;
