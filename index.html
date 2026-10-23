@@ -625,21 +625,35 @@
     //  group 'first' → before far cities, group 'last' → after them; within a group by `order`.
     //  leadDays: working days before delivery the order must go out (Fri/Sat skipped).
     //  Matching ignores quotes and case, and accepts a suffix ("ירושלים - קרית משה").
+    //  carrier: the משלוחן who takes deliveries to that city (see CARRIER below).
     CITIES: [
-      { aliases: ['ירושלים'],                                               group: 'first', order: 1, leadDays: 0 },
-      { aliases: ['ביתר', 'ביתר עילית'],                                     group: 'first', order: 2, leadDays: 0 },
-      { aliases: ['מודיעין עילית', 'מודיעין עלית', 'קרית ספר', 'קריית ספר', 'ק"ס'], group: 'first', order: 3, leadDays: 1 },
-      { aliases: ['ערד'],                                                   group: 'last',  order: 1, leadDays: 0 },
-      { aliases: ['קרית גת', 'קריית גת'],                                    group: 'last',  order: 2, leadDays: 0 },
-      { aliases: ['אלעד'],                                                  group: 'last',  order: 3, leadDays: 0 },
-      { aliases: ['בני ברק', 'ב"ב'],                                         group: 'last',  order: 4, leadDays: 0 },
-      // Abroad — handled like בני ברק (any city written in Latin letters counts as abroad too)
-      { aliases: ['לונדון', 'אנטוורפן', "מנצ'סטר"],                            group: 'last',  order: 4, leadDays: 0, abroad: true },
-      { aliases: ['אשדוד'],                                                 group: 'last',  order: 5, leadDays: 0 },
-      { aliases: ['בית שמש', 'רמת בית שמש'],                                  group: 'last',  order: 6, leadDays: 0 },
+      { aliases: ['ירושלים'],                                               group: 'first', order: 1, leadDays: 0, carrier: 'איצקוביץ' },
+      { aliases: ['ביתר', 'ביתר עילית'],                                     group: 'first', order: 2, leadDays: 0, carrier: 'איצקוביץ' },
+      { aliases: ['מודיעין עילית', 'מודיעין עלית', 'קרית ספר', 'קריית ספר', 'ק"ס'], group: 'first', order: 3, leadDays: 1, carrier: 'איצקוביץ' },
+      { aliases: ['ערד'],                                                   group: 'last',  order: 1, leadDays: 0, carrier: 'וידסלבסקי' },
+      { aliases: ['קרית גת', 'קריית גת'],                                    group: 'last',  order: 2, leadDays: 0, carrier: 'קוזליק' },
+      { aliases: ['אלעד'],                                                  group: 'last',  order: 3, leadDays: 0, carrier: 'מילר' },
+      { aliases: ['בני ברק', 'ב"ב'],                                         group: 'last',  order: 4, leadDays: 0, carrier: 'מילר' },
+      // Abroad — sorted like בני ברק (any city written in Latin letters counts as abroad too)
+      { aliases: ['לונדון', 'אנטוורפן', "מנצ'סטר"],                            group: 'last',  order: 4, leadDays: 0, carrier: 'שיפינג', abroad: true },
+      { aliases: ['אשדוד'],                                                 group: 'last',  order: 5, leadDays: 0, carrier: 'מילר' },
+      { aliases: ['בית שמש', 'רמת בית שמש'],                                  group: 'last',  order: 6, leadDays: 0, carrier: 'מנדי אייזנבך' },
     ],
     // Any other city is far: shipping takes this many working days (not counting pickup day, Fri, Sat)
     FAR_CITY_SHIPPING_DAYS: 3,
+
+    // ── Who takes each order (משלוחן) — shown in the urgency summary ──
+    //  Checked in this order: a name in the notes, self pickup, the agent, the pickup store, the city.
+    CARRIER: {
+      NOTE_OVERRIDES: [{ match: 'ויגדר', carrier: 'ויגדרוביץ' }],          // "ויגדרביץ", "ויגדרוביץ"…
+      SELF_PICKUP: 'איסוף עצמי',
+      AGENTS: ['שמואל שלמון', 'אלי ברוקס'],                                // agents with their own deliveries
+      PICKUPS: {
+        'איסוף מאשדוד': 'מילר', 'איסוף מבני ברק': 'מילר', 'איסוף מבית שמש': 'מנדי אייזנבך',
+        'איסוף ממאה שערים': 'פנחס', 'איסוף משמגר': 'פנחס',
+      },
+      FAR: 'שיפינג',                                                       // any city not in CITIES
+    },
 
     // ── Pickups from a store ("איסוף מ…"), in this order, after self pickup ──
     PICKUP_ORDER: ['איסוף מאשדוד', 'איסוף מבני ברק', 'איסוף ממאה שערים', 'איסוף משמגר', 'איסוף מבית שמש'],
@@ -919,6 +933,23 @@
     return null;
   }
 
+  // ── Who takes the order (משלוחן) — see CONFIG.CARRIER ──
+  function carrierFor({ desc, details, courier, agent, city }, cityEntry) {
+    const K = CONFIG.CARRIER;
+    const notes = `${details} ${courier}`;
+    const override = K.NOTE_OVERRIDES.find(o => notes.includes(o.match));
+    if (override) return override.carrier;
+    const d = normalizeText(desc);
+    if (d.includes('איסוף עצמי')) return K.SELF_PICKUP;
+    if (K.AGENTS.includes(agent)) return agent;
+    for (const [pickup, carrier] of Object.entries(K.PICKUPS)) {
+      if (d.includes(normalizeText(pickup))) return carrier;
+    }
+    if (d.includes('משלוח') && city) return cityEntry ? (cityEntry.carrier || '') : K.FAR;
+    if (!d && cityEntry) return cityEntry.carrier || '';    // no description: go by a known city
+    return '';
+  }
+
   // ── Kind of order, for the summary counts ──
   function orderType(desc) {
     const d = normalizeText(desc);
@@ -979,7 +1010,8 @@
       // Locate header row and relevant columns
       let orderCol = -1, deliveryCol = -1, baseDateCol = -1,
           branchCol = -1, agentCol = -1, descCol = -1,
-          cityAddrCol = -1, cityCol2 = -1, detailsCol = -1, courierCol = -1, customerCol = -1, headerRow = -1;
+          cityAddrCol = -1, cityCol2 = -1, streetAddrCol = -1, streetCol2 = -1,
+          detailsCol = -1, courierCol = -1, customerCol = -1, headerRow = -1;
 
       for (let r = 0; r < Math.min(15, rows.length); r++) {
         const row = rows[r];
@@ -1000,6 +1032,8 @@
           if (courierCol  < 0 && cell.includes('הוראות') && cell.includes('שליח')) courierCol = c;
           // For the urgency summary
           if (customerCol < 0 && cell.includes('שם לקוח')) customerCol = c;
+          if (streetAddrCol < 0 && cell.includes('רחוב') && cell.includes('כתובת')) streetAddrCol = c;
+          if (streetCol2    < 0 && cell === 'רחוב') streetCol2 = c;
         }
         if (orderCol >= 0 && deliveryCol >= 0) { headerRow = r; break; }
       }
@@ -1062,14 +1096,18 @@
             fields[rule.field] === rule.value && daysDiff(baseDateVal, deliveryVal) === rule.daysAfterBase);
 
         // פרטים לסיכום הדחיפויות (נשמר לכל הזמנה, גם לכאלה בלי תאריך או שדולגו)
+        // Street from the same address as the city ("רחוב - כתובת" with "עיר - כתובת")
+        const cell = col => (col >= 0 ? String(row[col] || '').trim() : '');
+        const street = (cityRaw ? cell(streetAddrCol) : cell(streetCol2)) || cell(streetAddrCol) || cell(streetCol2);
         const info = ordersInfo[order] = {
           customer: customerCol >= 0 ? String(row[customerCol] || '').trim() : '',
-          agent, desc: descVal, city, details, courier, deadline: note.deadline,
+          agent, desc: descVal, city, street, details, courier, deadline: note.deadline,
           type: orderType(descVal),
           isFar: isDelivery && !!city && !cityEntry,
           deliveryDate: null, excelExit: null, exitDate: null,
           status: skipDelivery ? 'skipped' : 'nodate',
         };
+        info.carrier = carrierFor(info, cityEntry);
 
         if (skipDelivery) { skippedCount++; continue; }
 
@@ -2222,14 +2260,17 @@
 
   // ── Draw the summary as A4 page canvases ──
   //  Drawn with Canvas, which lays out Hebrew + numbers + English correctly (pdf-lib can't).
+  //  Every order is a framed block: line 1 = order / customer / agent / destination,
+  //  then משלוחן, address, tags and the full notes — wrapped, never cut, never split across pages.
   //  pageOf: SO → page number in the merged file (only when the summary goes into a merge).
   const SUMMARY_FONT = '"Heebo", Arial, sans-serif';
   const SUMMARY_COLORS = {
-    navy: '#1e3a5f', accent: '#3b5bdb', text: '#1a2742', muted: '#6b7a99', faint: '#9aa6bf',
-    line: '#e9edf5', zebra: '#f8faff', box: '#f3f5fb', border: '#e1e7f2', onNavy: '#c5d3ea',
+    navy: '#1e3a5f', accent: '#3b5bdb', text: '#1a2742', muted: '#5b6782', faint: '#9aa6bf',
+    ink: '#2b2f36',                                         // strong lines that survive B&W printing
+    line: '#e9edf5', box: '#f3f5fb', border: '#c9d1e0', onNavy: '#c5d3ea',
     red: '#c92a2a', redBg: '#fff0f0', amber: '#a64d00', amberBg: '#fff4d6',
     blue: '#1c5bd8', blueBg: '#eaf1ff', green: '#0c8a64', greenBg: '#e6fcf5',
-    purple: '#6741d9', purpleBg: '#f3f0ff', gray: '#868e96', grayBg: '#f1f3f5',
+    purple: '#6741d9', purpleBg: '#f3f0ff', gray: '#6c757d', grayBg: '#f1f3f5',
   };
   async function renderSummaryPages(model, pageOf = null) {
     if (document.fonts) {
@@ -2237,19 +2278,23 @@
     }
     const C = SUMMARY_COLORS;
     const TYPE_COLOR = { delivery: C.blue, self: C.green, store: C.purple, other: C.gray };
-    const PW = 595, PH = 842, M = 26, S = 2.5;          // points; S = pixels per point (≈180 dpi)
-    const BOTTOM = PH - 42, ROW_H = 16;
+    const PW = 595, PH = 842, M = 30, S = 2.5;          // points; S = pixels per point (≈180 dpi)
+    const BOTTOM = PH - 44;
+    const LINE_H = 12;                                    // detail lines inside an order block
     const now = new Date();
     const stamp = `${now.getHours()}:${String(now.getMinutes()).padStart(2, '0')}`;
     const dateFull = `${HEB_DAYS[model.today.getDay()]} ${model.today.getDate()}/${model.today.getMonth() + 1}/${model.today.getFullYear()}`;
 
-    // Columns right → left
-    const cols = [['check', '', 16], ...(pageOf ? [['page', "עמ'", 24]] : []), ['so', 'הזמנה', 70],
-                  ['customer', 'לקוח', 120], ['agent', 'סוכן', 62], ['dest', 'יעד', 98], ['note', 'הערה', 0]];
-    cols[cols.length - 1][2] = PW - 2 * M - cols.reduce((s, c) => s + c[2], 0);
+    // Line-1 columns, right → left; the customer column takes what's left
+    const cols = [['check', '', 18], ...(pageOf ? [['page', "עמ'", 24]] : []), ['so', 'הזמנה', 74],
+                  ['customer', 'לקוח', 0], ['agent', 'סוכן', 76], ['dest', 'יעד', 118]];
+    const flexIdx = cols.findIndex(c => c[0] === 'customer');
+    cols[flexIdx][2] = PW - 2 * M - cols.reduce((s, c) => s + c[2], 0);
+    const DETAIL_RIGHT = PW - M - cols[0][2] - (pageOf ? cols[1][2] : 0) - 2;   // details start under "הזמנה"
+    const DETAIL_LEFT  = M + 8;
 
     const pages = [];
-    let ctx, y, zebra = false;
+    let ctx, y;
     const font = (size, weight = 400) => { ctx.font = `${weight} ${size}px ${SUMMARY_FONT}`; };
     const fit = (text, w) => {
       text = String(text ?? '');
@@ -2260,27 +2305,59 @@
     const textAt = (text, x, yy, w = 0, color = C.text, align = 'right') => {
       ctx.fillStyle = color; ctx.textAlign = align; ctx.fillText(fit(text, w), x, yy);
     };
-    const box = (x, yy, w, h, r, fill, stroke = null) => {
+    const box = (x, yy, w, h, r, fill, stroke = null, lw = 0.6) => {
       ctx.beginPath(); ctx.roundRect(x, yy, w, h, r);
       if (fill)   { ctx.fillStyle = fill; ctx.fill(); }
-      if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 0.6; ctx.stroke(); }
+      if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw; ctx.stroke(); }
     };
     const dot = (cx, cy, r, color) => { ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill(); };
-    const pill = (text, xRight, base, fg, bg) => {        // returns its width
-      const w = ctx.measureText(text).width + 9;
-      box(xRight - w, base - 8.5, w, 12, 6, bg);
-      textAt(text, xRight - 4.5, base, 0, fg);
-      return w;
-    };
     const wrap = (text, maxW) => {                        // current font
       const lines = []; let line = '';
-      for (const w of String(text).split(/\s+/)) {
+      for (const w of String(text).split(/\s+/).filter(Boolean)) {
         const test = line ? line + ' ' + w : w;
         if (line && ctx.measureText(test).width > maxW) { lines.push(line); line = w; } else line = test;
       }
       if (line) lines.push(line);
-      return lines;
+      return lines.length ? lines : [''];
     };
+
+    // Lay out tokens right → left with wrapping. Pills never break; text breaks between words.
+    // Returns the number of lines used; draws only when `draw` is true.
+    function flow(tokens, xRight, xLeft, yTop, lineH, draw) {
+      let x = xRight, line = 0;
+      const newLine = () => { line++; x = xRight; };
+      const base = () => yTop + line * lineH + 9;
+      for (const t of tokens) {
+        if (t.pill) {
+          font(7.5, 700);
+          const w = ctx.measureText(t.text).width + 10;
+          if (x - w < xLeft && x !== xRight) newLine();
+          if (draw) {
+            box(x - w, base() - 8.5, w, 12, 6, t.bg, t.fg, 0.7);
+            textAt(t.text, x - 5, base(), 0, t.fg);
+          }
+          x -= w + 4;
+          continue;
+        }
+        font(t.size || 8, t.weight || 400);
+        let words = String(t.text).split(/\s+/).filter(Boolean);
+        while (words.length) {
+          const avail = x - xLeft;
+          let k = words.length;
+          while (k > 0 && ctx.measureText(words.slice(0, k).join(' ')).width > avail) k--;
+          if (k === 0) {
+            if (x !== xRight) { newLine(); continue; }
+            k = 1;                                          // one very long word: let it shrink-fit
+          }
+          const s = words.slice(0, k).join(' ');
+          if (draw) textAt(s, x, base(), avail, t.color || C.text);
+          x -= Math.min(ctx.measureText(s).width, avail) + (t.gap ?? 6);
+          words = words.slice(k);
+          if (words.length) newLine();
+        }
+      }
+      return line + 1;
+    }
 
     // ── Pages ──
     function newPage() {
@@ -2291,9 +2368,7 @@
       ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, PW, PH);
       ctx.direction = 'rtl';
       pages.push(canvas);
-      zebra = false;
       if (pages.length === 1) return;
-      // Continuation: slim band + column header
       ctx.fillStyle = C.navy; ctx.fillRect(0, 0, PW, 30);
       ctx.fillStyle = C.accent; ctx.fillRect(0, 30, PW, 2);
       font(11, 700); textAt('סיכום דחיפויות · המשך', PW - M, 20, 0, '#fff');
@@ -2304,108 +2379,141 @@
     const need = h => { if (y + h > BOTTOM) newPage(); };
 
     function columnHeader() {
-      box(M, y, PW - 2 * M, 17, 4, C.box);
+      box(M, y, PW - 2 * M, 17, 4, C.box, C.ink, 0.8);
       font(7.5, 700);
       let x = PW - M;
-      for (const [, title, w] of cols) { textAt(title, x - 4, y + 11.5, w - 6, C.muted); x -= w; }
+      for (const [, title, w] of cols) { textAt(title, x - 5, y + 11.5, w - 8, C.text); x -= w; }
       y += 21;
     }
 
-    // Day / section header: tinted bar with an accent strip on the right, counts on the left
-    function sectionHeader(title, sub, accent, tint, rows = null) {
-      need(30 + ROW_H);                                   // keep a header with its first row
-      y += 6;
-      box(M, y, PW - 2 * M, 22, 5, tint);
-      ctx.fillStyle = accent; ctx.beginPath(); ctx.roundRect(PW - M - 4, y, 4, 22, [0, 5, 5, 0]); ctx.fill();
-      font(11, 800); textAt(title, PW - M - 12, y + 15, 0, C.navy);
-      const tw = ctx.measureText(title).width;
-      if (sub) { font(8, 400); textAt(sub, PW - M - 12 - tw - 8, y + 15, 0, C.muted); }
-      if (rows) {                                         // "● משלוחים 3  ● איסוף עצמי 2" on the left
-        const t = { delivery: 0, self: 0, store: 0, other: 0 };
-        rows.forEach(r => t[r.info.type]++);
-        let x = M + 8;
-        font(7.5, 500);
-        for (const k of Object.keys(t).reverse()) {
-          if (!t[k]) continue;
-          const label = `${TYPE_LABELS[k]} ${t[k]}`;
-          textAt(label, x, y + 14.5, 0, C.muted, 'left');
-          const w = ctx.measureText(label).width;
-          dot(x + w + 5, y + 11.5, 2.6, TYPE_COLOR[k]);
-          x += w + 16;
-        }
-      }
-      y += 26;
-      zebra = false;
-    }
-
+    // ── One order: framed block ──
     function destText(i) {
       if (i.type === 'delivery') return `${i.city || '—'} · ${i.isFar ? 'רחוק' : 'משלוח'}`;
       if (i.type === 'self') return 'איסוף עצמי';
       return i.desc || '—';
     }
 
-    function noteCell(r, kind, xRight, base, width) {
-      const i = r.info, left = xRight - width;
-      const pills = [];
-      if (kind !== 'day' && i.exitDate) pills.push([`יציאה ${shortDate(i.exitDate)}`, C.red, C.redBg]);
-      if (i.deadline !== null && i.deadline !== undefined) pills.push([`עד ${formatMinutes(i.deadline)}`, C.amber, C.amberBg]);
+    function detailTokens(r, kind) {
+      const i = r.info, tokens = [];
+      tokens.push({ pill: true, text: `משלוחן: ${i.carrier || '—'}`, fg: C.ink, bg: '#eef1f6' });
+      if ((i.type === 'delivery' || i.type === 'other') && (i.street || i.city)) {
+        tokens.push({ text: 'כתובת:', weight: 700, size: 8, color: C.text, gap: 4 });
+        tokens.push({ text: [i.street, i.city].filter(Boolean).join(', '), size: 8, color: C.text });
+      }
+      if (kind !== 'day' && i.exitDate) tokens.push({ pill: true, text: `יציאה ${shortDate(i.exitDate)}`, fg: C.red, bg: C.redBg });
+      if (i.deadline !== null && i.deadline !== undefined) {
+        tokens.push({ pill: true, text: `עד ${formatMinutes(i.deadline)}`, fg: C.amber, bg: C.amberBg });
+      }
       if (i.excelExit && i.exitDate && toDateKey(i.excelExit) !== toDateKey(i.exitDate)) {
-        pills.push([`${i.exitDate < i.excelExit ? 'הוקדם' : 'נדחה'} מ-${shortDate(i.excelExit)}`, C.blue, C.blueBg]);
+        tokens.push({ pill: true, text: `${i.exitDate < i.excelExit ? 'הוקדם' : 'נדחה'} מ-${shortDate(i.excelExit)}`, fg: C.blue, bg: C.blueBg });
       }
-      if (i.isFar && kind === 'day' && r.pos.date <= model.tomorrowKey) pills.push(['חייב לצאת', C.red, C.redBg]);
-      if (r.engraving) pills.push(['הטבעה', C.amber, C.amberBg]);
-
-      let x = xRight;
-      font(7.5, 700);
-      for (const [t, fg, bg] of pills) {
-        if (x - left < ctx.measureText(t).width + 30) break;
-        x -= pill(t, x, base, fg, bg) + 3;
-      }
-      const parts = [];
-      if (i.lead && i.deliveryDate) parts.push(`אספקה ${shortDate(i.deliveryDate)}`);
-      const note = [i.details, i.courier].filter(Boolean).join(' · ');
-      if (note) parts.push(note);
-      font(7.5, 400);
-      if (parts.length && x - left > 14) textAt(parts.join(' · '), x, base, x - left, C.muted);
+      if (i.isFar && kind === 'day' && r.pos.date <= model.tomorrowKey) tokens.push({ pill: true, text: 'חייב לצאת', fg: C.red, bg: C.redBg });
+      if (r.engraving) tokens.push({ pill: true, text: 'הטבעה', fg: C.amber, bg: C.amberBg });
+      if (i.lead && i.deliveryDate) tokens.push({ text: `אספקה ${shortDate(i.deliveryDate)}`, weight: 700, size: 8, color: C.muted });
+      const notes = [i.details, i.courier].filter(Boolean).join(' · ');
+      if (notes) tokens.push({ text: notes, size: 8, color: C.muted });
+      return tokens;
     }
 
-    function row(r, kind) {                               // kind: 'overdue' | 'day' | 'missing'
-      need(ROW_H);
-      if (zebra) { ctx.fillStyle = C.zebra; ctx.fillRect(M, y, PW - 2 * M, ROW_H); }
-      zebra = !zebra;
-      const i = r.info, base = y + 11;
+    function orderBlock(r, kind, reserveExtra = 0) {
+      const i = r.info;
+      const custW = cols[flexIdx][2] - 8;
+      font(8.5, 700);
+      const custLines = wrap(i.customer || '—', custW);
+      const line1H = 13 * custLines.length;
+      const tokens = detailTokens(r, kind);
+      const detailLines = flow(tokens, DETAIL_RIGHT, DETAIL_LEFT, 0, LINE_H, false);
+      const h = 4 + line1H + 2 + detailLines * LINE_H + 4;
+      need(h + 3 + reserveExtra);
+
+      box(M, y, PW - 2 * M, h, 3, '#fff', C.ink, 0.8);
+      // thin divider between line 1 and the details
+      ctx.strokeStyle = C.line; ctx.lineWidth = 0.6;
+      ctx.beginPath(); ctx.moveTo(DETAIL_LEFT - 2, y + 4 + line1H + 1); ctx.lineTo(DETAIL_RIGHT + 2, y + 4 + line1H + 1); ctx.stroke();
+
+      const base = y + 13;
       let x = PW - M;
       for (const [key, , w] of cols) {
-        const cx = x - 4, cw = w - 6;
-        if (key === 'check') box(x - 12, y + 4, 8, 8, 2, '#fff', C.faint);
-        if (key === 'page')     { font(8, 500); textAt(pageOf[r.so] ?? '', cx, base, cw, C.muted); }
+        const cx = x - 5, cw = w - 8;
+        if (key === 'check')    box(x - 13, y + 5, 9, 9, 2, '#fff', C.ink, 0.9);
+        if (key === 'page')     { font(8, 700); textAt(pageOf[r.so] ?? '', cx, base, cw, C.muted); }
         if (key === 'so')       { font(8, 700); textAt(r.so, cx, base, cw, C.navy); }
-        if (key === 'customer') { font(8.5, 500); textAt(i.customer || '—', cx, base, cw); }
+        if (key === 'customer') { font(8.5, 700); custLines.forEach((l, k) => textAt(l, cx, base + k * 13, cw)); }
         if (key === 'agent')    { font(8, 400); textAt(i.agent || '—', cx, base, cw, C.muted); }
         if (key === 'dest') {
-          dot(cx - 2.5, y + 8, 2.6, TYPE_COLOR[i.type]);
-          font(8.5, 400); textAt(destText(i), cx - 9, base, cw - 9);
+          dot(cx - 2.5, y + 9.5, 2.8, TYPE_COLOR[i.type]);
+          font(8.5, 500); textAt(destText(i), cx - 9, base, cw - 9);
         }
-        if (key === 'note') noteCell(r, kind, cx, base, cw);
         x -= w;
       }
-      y += ROW_H;
-      ctx.strokeStyle = C.line; ctx.lineWidth = 0.5;
-      ctx.beginPath(); ctx.moveTo(M, y); ctx.lineTo(PW - M, y); ctx.stroke();
+      flow(tokens, DETAIL_RIGHT, DETAIL_LEFT, y + 4 + line1H + 2, LINE_H, true);
+      y += h + 3;
     }
 
-    // Soft box with a title and wrapped text (no-urgency list, not-in-Excel list, all-clear)
+    // ── Day / section header: bordered, accent strip, then a carrier summary line ──
+    function sectionHeader(title, sub, accent, tint, rows, firstBlockH = 40) {
+      const tokens = [];
+      if (rows && rows.length) {
+        const counts = {};
+        rows.forEach(r => { const c = r.info.carrier || 'בלי משלוחן'; counts[c] = (counts[c] || 0) + 1; });
+        tokens.push({ text: 'יוצא עם:', weight: 700, size: 8, color: C.text, gap: 6 });
+        Object.entries(counts).sort((a, b) => b[1] - a[1]).forEach(([c, n]) => {
+          tokens.push({ pill: true, text: `${c} · ${n}`, fg: C.ink, bg: '#fff' });
+        });
+      }
+      const sumLines = tokens.length ? flow(tokens, PW - M - 16, M + 10, 0, 14, false) : 0;
+      const h = 22 + (sumLines ? sumLines * 14 + 4 : 0);
+      need(6 + h + 4 + firstBlockH);                       // keep the header with its first order
+      y += 6;
+      box(M, y, PW - 2 * M, h, 5, tint, C.ink, 1);
+      ctx.fillStyle = accent; ctx.beginPath(); ctx.roundRect(PW - M - 6, y, 6, h, [0, 5, 5, 0]); ctx.fill();
+      font(12, 800); textAt(title, PW - M - 16, y + 16, 0, C.navy);
+      const tw = ctx.measureText(title).width;
+      if (sub) { font(8.5, 500); textAt(sub, PW - M - 16 - tw - 10, y + 16, PW - 2 * M - tw - 40, C.muted); }
+      if (sumLines) flow(tokens, PW - M - 16, M + 10, y + 22, 14, true);
+      y += h + 4;
+    }
+
+    function firstBlockHeight(r, kind) {
+      font(8.5, 700);
+      const custLines = wrap(r.info.customer || '—', cols[flexIdx][2] - 8).length;
+      return 4 + 13 * custLines + 2 + flow(detailTokens(r, kind), DETAIL_RIGHT, DETAIL_LEFT, 0, LINE_H, false) * LINE_H + 7;
+    }
+
+    // Soft bordered box with a title and wrapped text
     function noteBox(title, text, fg, bg) {
       font(8, 400);
       const lines = text ? wrap(text, PW - 2 * M - 24) : [];
-      const h = 22 + lines.length * 11 + (lines.length ? 4 : 0);
+      const h = 22 + (text ? lines.length * 11 + 4 : 0);
       need(h + 8);
       y += 6;
-      box(M, y, PW - 2 * M, h, 6, bg);
+      box(M, y, PW - 2 * M, h, 6, bg, C.ink, 0.8);
       font(9, 700); textAt(title, PW - M - 12, y + 14, 0, fg);
       font(8, 400);
-      lines.forEach((l, k) => textAt(l, PW - M - 12, y + 27 + k * 11, 0, C.muted));
+      if (text) lines.forEach((l, k) => textAt(l, PW - M - 12, y + 27 + k * 11, 0, C.text));
       y += h + 2;
+    }
+
+    // Horizontal bar chart (per agent / per carrier)
+    function bars(title, entries) {
+      if (!entries.length) return;
+      const shown = entries.slice(0, 12);
+      const BAR_H = 13, max = Math.max(...shown.map(a => a[1]));
+      need(28 + shown.length * BAR_H);
+      y += 10;
+      font(9.5, 800); textAt(title, PW - M, y + 9, 0, C.navy);
+      y += 16;
+      const nameW = 96, barMax = 200;
+      for (const [name, n] of shown) {
+        font(8, 500); textAt(name, PW - M, y + 9, nameW - 6, C.text);
+        const bw = Math.max(4, barMax * n / max);
+        box(PW - M - nameW - bw, y + 2, bw, 9, 2, C.blueBg, C.ink, 0.5);
+        font(8, 700); textAt(String(n), PW - M - nameW - bw - 5, y + 9.5, 0, C.navy);
+        y += BAR_H;
+      }
+      if (entries.length > shown.length) {
+        font(7.5, 400); textAt(`ועוד ${entries.length - shown.length}`, PW - M, y + 9, 0, C.muted); y += 12;
+      }
     }
 
     // ── Page 1: header band ──
@@ -2417,9 +2525,7 @@
     font(26, 800); textAt(String(model.total), M, 40, 0, '#fff', 'left');
     const totalW = ctx.measureText(String(model.total)).width;
     font(9, 500); textAt('הזמנות ברשימה', M + totalW + 7, 38, 0, C.onNavy, 'left');
-    font(7.5, 400);
-    // ⁨…⁩ isolates the file name so "x.xlsx" doesn't scramble the Hebrew around it
-    textAt(`הופק ב-${stamp} · ⁨${excelFileName}⁩`, M, 58, 260, C.onNavy, 'left');
+    font(8, 400); textAt(`הופק ב-${stamp}`, M, 58, 0, C.onNavy, 'left');
     y = 96;
 
     // ── Count cards: overdue, each day, no urgency ──
@@ -2433,10 +2539,10 @@
     cards.forEach(([label, n, [accent, bg]], k) => {
       if (k && k % perRow === 0) y += CH + GAP;
       const xr = PW - M - (k % perRow) * (CW + GAP);
-      box(xr - CW, y, CW, CH, 6, bg, C.border);
-      ctx.fillStyle = accent; ctx.beginPath(); ctx.roundRect(xr - CW, y, CW, 3, [6, 6, 0, 0]); ctx.fill();
-      font(7.5, 500); textAt(label, xr - CW / 2, y + 15, CW - 6, C.muted, 'center');
-      font(17, 800); textAt(String(n), xr - CW / 2, y + 36, 0, accent === C.faint ? C.navy : accent, 'center');
+      box(xr - CW, y, CW, CH, 6, bg, C.ink, 0.8);
+      ctx.fillStyle = accent; ctx.beginPath(); ctx.roundRect(xr - CW, y, CW, 4, [6, 6, 0, 0]); ctx.fill();
+      font(7.5, 700); textAt(label, xr - CW / 2, y + 16, CW - 6, C.text, 'center');
+      font(17, 800); textAt(String(n), xr - CW / 2, y + 37, 0, accent === C.faint ? C.navy : accent, 'center');
     });
     y += CH + 10;
 
@@ -2449,7 +2555,7 @@
       font(8, 500);
       for (const [label, color] of chips) {
         const w = ctx.measureText(label).width + 20;
-        box(x - w, y, w, 16, 8, C.box);
+        box(x - w, y, w, 16, 8, '#fff', C.border, 0.8);
         dot(x - 8, y + 8, 3, color);
         textAt(label, x - 14, y + 11.5, 0, C.text);
         x -= w + 5;
@@ -2460,8 +2566,8 @@
 
     // ── Overdue, then every day ──
     if (model.overdue.length) {
-      sectionHeader('באיחור', 'היה צריך לצאת לפני היום', C.red, C.redBg, model.overdue);
-      model.overdue.forEach(r => row(r, 'overdue'));
+      sectionHeader('באיחור', 'היה צריך לצאת לפני היום', C.red, C.redBg, model.overdue, firstBlockHeight(model.overdue[0], 'overdue'));
+      model.overdue.forEach(r => orderBlock(r, 'overdue'));
     }
     for (const d of model.days) {
       const isToday = d.key === model.todayKey, isTomorrow = d.key === model.tomorrowKey;
@@ -2469,12 +2575,12 @@
       const count = d.rows.length === 1 ? 'הזמנה אחת' : `${d.rows.length} הזמנות`;
       sectionHeader(name, date ? `${date} · ${count}` : count,
                     isToday ? C.amber : isTomorrow ? C.accent : C.faint,
-                    isToday ? C.amberBg : isTomorrow ? C.blueBg : C.box, d.rows);
-      d.rows.forEach(r => row(r, 'day'));
+                    isToday ? C.amberBg : isTomorrow ? C.blueBg : C.box, d.rows, firstBlockHeight(d.rows[0], 'day'));
+      d.rows.forEach(r => orderBlock(r, 'day'));
     }
     if (!model.overdue.length && !model.days.length) noteBox('אין הזמנות עם תאריך יציאה', '', C.muted, C.box);
 
-    // ── Bottom: no urgency, not in Excel, urgent without PDF, per agent ──
+    // ── Bottom: no urgency, not in Excel, urgent without PDF, per carrier / agent ──
     y += 6;
     if (model.noUrgency.length) {
       noteBox(`בלי דחיפות · ${model.noUrgency.length} הזמנות`,
@@ -2484,48 +2590,27 @@
       noteBox(`לא נמצאו באקסל · ${model.notInExcel.length} קבצים`, model.notInExcel.join(', '), C.amber, C.amberBg);
     }
     if (model.missing.length) {
-      sectionHeader('דחופות בלי קובץ PDF', `${model.missing.length} הזמנות מהאקסל שצריכות לצאת עד מחר`, C.red, C.redBg, model.missing);
-      model.missing.slice(0, MISSING_MAX_ROWS).forEach(r => row(r, 'missing'));
+      const shown = model.missing.slice(0, MISSING_MAX_ROWS);
+      sectionHeader('דחופות בלי קובץ PDF', `${model.missing.length} הזמנות מהאקסל שצריכות לצאת עד מחר`, C.red, C.redBg, shown,
+                    firstBlockHeight(shown[0], 'missing'));
+      shown.forEach(r => orderBlock(r, 'missing'));
       if (model.missing.length > MISSING_MAX_ROWS) {
         need(14); font(8, 400); textAt(`ועוד ${model.missing.length - MISSING_MAX_ROWS} הזמנות`, PW - M - 12, y + 11, 0, C.muted); y += 14;
       }
-    } else {
-      noteBox('לכל ההזמנות הדחופות יש קובץ PDF', '', C.green, C.greenBg);
     }
-
-    // Per agent: small bar chart
-    if (model.agents.length) {
-      const shown = model.agents.slice(0, 12);
-      const BAR_H = 13, max = Math.max(...shown.map(a => a[1]));
-      need(26 + shown.length * BAR_H);
-      y += 10;
-      font(9, 700); textAt('לפי סוכן', PW - M, y + 9, 0, C.navy);
-      y += 16;
-      const nameW = 90, barMax = 220;
-      for (const [agent, n] of shown) {
-        font(8, 500); textAt(agent, PW - M, y + 9, nameW - 6, C.text);
-        const bw = Math.max(4, barMax * n / max);
-        box(PW - M - nameW - bw, y + 2, bw, 9, 3, C.blueBg);
-        ctx.fillStyle = C.accent; ctx.fillRect(PW - M - nameW - 2, y + 2, 2, 9);
-        font(8, 700); textAt(String(n), PW - M - nameW - bw - 5, y + 9.5, 0, C.navy);
-        y += BAR_H;
-      }
-      if (model.agents.length > shown.length) {
-        font(7.5, 400); textAt(`ועוד ${model.agents.length - shown.length} סוכנים`, PW - M, y + 9, 0, C.muted); y += 12;
-      }
-    }
+    bars('לפי סוכן', model.agents);
 
     // ── Footer on every page ──
     pages.forEach((canvas, k) => {
       ctx = canvas.getContext('2d');
       ctx.setTransform(S, 0, 0, S, 0, 0);
       ctx.direction = 'rtl';
-      ctx.strokeStyle = C.border; ctx.lineWidth = 0.6;
+      ctx.strokeStyle = C.ink; ctx.lineWidth = 0.6;
       ctx.beginPath(); ctx.moveTo(M, PH - 28); ctx.lineTo(PW - M, PH - 28); ctx.stroke();
       font(7.5, 400);
-      textAt(`סיכום דחיפויות · ${dateFull} · הופק ב-${stamp}`, PW - M, PH - 16, 0, C.faint);
+      textAt(`סיכום דחיפויות · ${dateFull} · הופק ב-${stamp}`, PW - M, PH - 16, 0, C.muted);
       font(7.5, 700);
-      textAt(`עמוד ${k + 1} מתוך ${pages.length}`, M, PH - 16, 0, C.muted, 'left');
+      textAt(`עמוד ${k + 1} מתוך ${pages.length}`, M, PH - 16, 0, C.text, 'left');
     });
     return pages;
   }
