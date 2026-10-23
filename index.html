@@ -292,10 +292,11 @@
       border-right: 4px solid var(--success);
     }
     .excel-bar-icon { font-size: 1.6rem; flex-shrink: 0; }
-    .excel-bar-text { flex: 1; min-width: 0; }
+    .excel-bar-text { flex: 1 1 240px; min-width: 200px; }
     .excel-bar-text strong { display: block; font-size: 0.88rem; color: var(--navy); font-weight: 700; margin-bottom: 2px; }
     .excel-bar-text span { font-size: 0.77rem; color: var(--muted); }
-    .excel-bar-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; flex-wrap: wrap; }
+    .excel-bar-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 1; min-width: 0; flex-wrap: wrap; }
+    #excelInfo { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .btn-excel {
       background: none; border: 1.5px solid var(--success); color: var(--success);
       border-radius: 7px; padding: 6px 16px;
@@ -305,7 +306,7 @@
     .btn-excel:hover { background: var(--success-light); }
     .excel-loaded-row {
       display: none; align-items: center; gap: 8px;
-      font-size: 0.8rem; color: var(--success); font-weight: 600; flex-shrink: 0;
+      font-size: 0.8rem; color: var(--success); font-weight: 600; flex-shrink: 1; min-width: 0;
     }
     .excel-loaded-row.visible { display: flex; }
     .excel-loaded-row .btn-excel-clear {
@@ -512,6 +513,8 @@
       </div>
       <input type="file" id="excelInput" accept=".xlsx,.xls,.csv" style="display:none">
       <button class="btn-excel" id="excelUploadBtn" type="button">📎 בחר אקסל</button>
+      <button class="btn-excel" id="excelSummaryBtn" type="button" style="display:none"
+              title="סיכום דחיפויות. בלי קבצי PDF ברשימה: לכל ההזמנות שבאקסל">📋 הורד סיכום</button>
     </div>
   </div>
 
@@ -754,6 +757,7 @@
   const optOpenAfter   = document.getElementById('optOpenAfter');
   const optSummaryFirst= document.getElementById('optSummaryFirst');
   const summaryBtn     = document.getElementById('summaryBtn');
+  const excelSummaryBtn= document.getElementById('excelSummaryBtn');
 
   // ── Sortable ──
   sortableInst = new Sortable(fileListEl, {
@@ -798,7 +802,8 @@
   excelClearBtn.addEventListener('click', clearExcel);
   mergeBtn.addEventListener('click', () => runMerge(false));
   mergeAnnexBtn.addEventListener('click', () => runMerge(true));
-  summaryBtn.addEventListener('click', downloadSummary);
+  summaryBtn.addEventListener('click', () => downloadSummary(summaryBtn));
+  excelSummaryBtn.addEventListener('click', () => downloadSummary(excelSummaryBtn));
   mergeAgainBtn.addEventListener('click', () => {
     resultSection.classList.remove('visible');
     fileListCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -1136,8 +1141,11 @@
       excelLoaded = true;
       excelLoadedRow.classList.add('visible');
       const skipNote = skippedCount ? ` · ${skippedCount} דולגו (כלל מיוחד)` : '';
-      excelInfo.textContent = `✅ ${file.name} · ${matchCount} הזמנות${skipNote}`;
+      // Counts first: a long file name is cut with "…" (full text on hover)
+      excelInfo.textContent = `✅ ${matchCount} הזמנות${skipNote} · ${file.name}`;
+      excelInfo.title = excelInfo.textContent;
       excelUploadBtn.textContent = '🔄 החלף אקסל';
+      excelSummaryBtn.style.display = '';
       dateSortBtn.disabled = false;
       refreshNoteBadges();
       hideAlert();
@@ -1157,6 +1165,7 @@
     excelLoadedRow.classList.remove('visible');
     excelInfo.textContent = '';
     excelUploadBtn.textContent = '📎 בחר אקסל';
+    excelSummaryBtn.style.display = 'none';
     dateSortBtn.disabled = true;
     refreshNoteBadges();
   }
@@ -2199,9 +2208,14 @@
     const tomorrow = new Date(today); tomorrow.setDate(tomorrow.getDate() + 1);
     const todayKey = toDateKey(today), tomorrowKey = toDateKey(tomorrow);
 
-    // Unique orders in the list (a confirmation and its annex are one order)
+    // Unique orders in the list (a confirmation and its annex are one order).
+    // Excel only (no PDFs loaded): every order in the Excel.
+    const excelOnly = !files.length;
     const listed = new Map();
     const notInExcel = [];
+    if (excelOnly) {
+      for (const so of Object.keys(ordersInfo)) listed.set(so, { so, engraving: false });
+    }
     for (const f of files) {
       const so = extractSOFromName(f.name);
       if (!so) { notInExcel.push(f.name); continue; }
@@ -2252,7 +2266,7 @@
     });
 
     return {
-      today, todayKey, tomorrowKey, overdue, days, noUrgency, notInExcel, missing, byType,
+      today, todayKey, tomorrowKey, overdue, days, noUrgency, notInExcel, missing, byType, excelOnly,
       total: listed.size, engravings: all.filter(r => r.engraving).length,
       agents: Object.entries(agents).sort((a, b) => b[1] - a[1]),
     };
@@ -2524,7 +2538,7 @@
     font(11, 400); textAt(dateFull, PW - M, 58, 0, C.onNavy);
     font(26, 800); textAt(String(model.total), M, 40, 0, '#fff', 'left');
     const totalW = ctx.measureText(String(model.total)).width;
-    font(9, 500); textAt('הזמנות ברשימה', M + totalW + 7, 38, 0, C.onNavy, 'left');
+    font(9, 500); textAt(model.excelOnly ? 'הזמנות באקסל' : 'הזמנות ברשימה', M + totalW + 7, 38, 0, C.onNavy, 'left');
     font(8, 400); textAt(`הופק ב-${stamp}`, M, 58, 0, C.onNavy, 'left');
     y = 96;
 
@@ -2625,14 +2639,14 @@
     }
   }
 
-  // ── "הורד סיכום דחיפויות" button ──
-  async function downloadSummary() {
+  // ── "הורד סיכום דחיפויות" buttons (under the merge buttons, and in the Excel bar) ──
+  //  With no PDFs in the list the summary covers every order in the Excel.
+  async function downloadSummary(btn) {
     hideAlert();
     if (!excelLoaded) { showAlert('כדי להפיק סיכום דחיפויות צריך קודם לטעון קובץ אקסל'); return; }
-    if (!files.length) return;
-    const label = summaryBtn.textContent;
-    summaryBtn.disabled = true;
-    summaryBtn.textContent = '⏳ מכין סיכום...';
+    const label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '⏳ מכין סיכום...';
     try {
       const doc = await PDFLib.PDFDocument.create();
       await addSummaryPages(doc, await renderSummaryPages(buildSummaryModel()));
@@ -2641,8 +2655,8 @@
     } catch (e) {
       showAlert('שגיאה בהפקת הסיכום: ' + e.message);
     }
-    summaryBtn.disabled = false;
-    summaryBtn.textContent = label;
+    btn.disabled = false;
+    btn.textContent = label;
   }
 
   function downloadBytes(bytes, name) {
